@@ -1,0 +1,101 @@
+# Builds installers with tauri-action and attaches them to a DRAFT GitHub release.
+#
+# The pushed tag (vX.Y.Z) must match the version declared in package.json,
+# src-tauri/Cargo.toml and src-tauri/tauri.conf.json, so bump all three files
+# before tagging. Releases stay drafts: publishing is a manual decision.
+#
+# A single `create-release` job creates the draft once; the parallel build jobs
+# only upload their installers to it (matrix jobs creating it themselves race
+# and produce one draft per OS). For a manual dry run, pass a throwaway `tag`
+# (for example v0.0.0-test) and delete the draft afterwards.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag for the draft release (use a throwaway tag such as v0.0.0-test for a dry run)
+        type: string
+        required: true
+      prerelease:
+        description: Mark the draft release as a pre-release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          # Tag pushes are regular releases; manual dry runs can be marked pre-release.
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY/releases"
+          filter=".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(.draft)\""
+          existing=$(gh api "$api" --paginate --jq "$filter" | head -n 1)
+          if [ -n "$existing" ]; then
+            id=${existing% *}
+            if [ "${existing#* }" != "true" ]; then
+              echo "::error::Release $TAG is already published; refusing to overwrite its assets."
+              exit 1
+            fi
+          else
+            id=$(gh api "$api" -X POST \
+              -f tag_name="$TAG" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="Rabbit Tool $TAG" \
+              -f body="Instaladores para Windows (.msi / .exe) y Linux (.deb / .rpm / .AppImage). Ver el README." \
+              -F draft=true \
+              -F prerelease="$PRERELEASE" \
+              --jq .id)
+          fi
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}

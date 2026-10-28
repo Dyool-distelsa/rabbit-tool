@@ -443,7 +443,7 @@ fn progress(app: &AppHandle, op: &str, done: u32, total: u32) {
 // --- comandos -------------------------------------------------------------------
 
 /// Verifica credenciales, acceso al vhost y AMQP, sin listar colas. Solo usa
-/// endpoints que no exigen el tag administrator (como hermes-diagnostics).
+/// endpoints que no exigen el tag administrator.
 #[tauri::command]
 async fn ping(state: State<'_, AppState>, conn: Conn) -> R<Value> {
     log::info!("ping: {}", conn.desc());
