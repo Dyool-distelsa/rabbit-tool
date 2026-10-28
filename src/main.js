@@ -56,7 +56,11 @@ const S = {
   localItems: [],
   view: [], // items filtrados que muestra la lista
   sel: -1, // índice en view del mensaje abierto en el detalle
-  checked: new Set(), // claves seleccionadas en el respaldo local
+  fileItems: [], // mensajes cargados desde un .json
+  fileName: '',
+  backupId: null, // respaldo mostrado en la pestaña (null = el último)
+  // Selección por pestaña: claves de items (índice en cola/archivo, "run:n" en respaldo).
+  picks: { queue: new Set(), file: new Set(), local: new Set() },
   lastCheck: -1,
   detailView: 'payload',
   op: null, // operación en curso { label, total, start, cancellable }
@@ -386,7 +390,13 @@ $('queues').addEventListener('click', (ev) => {
   if (li.dataset.name !== S.current) {
     setCurrent(li.dataset.name);
     S.qItems = [];
+    S.picks.queue.clear();
     S.peekToken++;
+  }
+  // Desde la pestaña Archivo, elegir una cola la propone como destino.
+  if (S.tab === 'file') {
+    $('fileTarget').value = li.dataset.name;
+    return;
   }
   if (S.tab !== 'queue') setTab('queue');
   else applyFilter();
@@ -394,9 +404,9 @@ $('queues').addEventListener('click', (ev) => {
 
 // Sugerencias de cola destino: búsqueda acotada en el broker mientras se escribe.
 let targetTimer = 0;
-$('target').addEventListener('input', () => {
+const suggestQueues = (ev) => {
   clearTimeout(targetTimer);
-  const name = $('target').value.trim();
+  const name = ev.target.value.trim();
   if (!name || !S.connected) return;
   targetTimer = setTimeout(async () => {
     try {
@@ -406,7 +416,8 @@ $('target').addEventListener('input', () => {
       $('queueNames').replaceChildren(dl);
     } catch {}
   }, 250);
-});
+};
+for (const id of ['target', 'fileTarget', 'confirmQueue']) $(id).addEventListener('input', suggestQueues);
 
 // --- normalización + filtro local -------------------------------------------------
 function normQueueMsg(m, i) {
@@ -415,6 +426,34 @@ function normQueueMsg(m, i) {
 function normLocal(b, i) {
   return { ...b, key: `${b.batch}:${b.n}`, idx: i + 1 };
 }
+
+/**
+ * Un elemento del array del archivo. Es el cuerpo del mensaje tal cual, salvo que
+ * sea un "sobre" {payload, properties?, routing_key?} (como lo que muestra la app):
+ * ahí se respetan sus properties.
+ */
+const ENVELOPE_KEYS = new Set(['payload', 'properties', 'routing_key', 'exchange']);
+function normFile(el, i) {
+  const envelope =
+    el && typeof el === 'object' && !Array.isArray(el) && 'payload' in el && Object.keys(el).every((k) => ENVELOPE_KEYS.has(k));
+  const body = envelope ? el.payload : el;
+  const payload = typeof body === 'string' ? body : JSON.stringify(body);
+  const properties = envelope && el.properties ? el.properties : { content_type: 'application/json', delivery_mode: 2 };
+  return {
+    key: i,
+    idx: i + 1,
+    file: true,
+    payload,
+    properties,
+    routing_key: envelope ? el.routing_key || '' : '',
+    size: new TextEncoder().encode(payload).length,
+  };
+}
+
+/** Items y selección de la pestaña activa. */
+const itemsOf = (tab = S.tab) => (tab === 'queue' ? S.qItems : tab === 'file' ? S.fileItems : S.localItems);
+const picks = (tab = S.tab) => S.picks[tab];
+const pickedItems = (tab = S.tab) => itemsOf(tab).filter((it) => picks(tab).has(it.key));
 
 function hay(it) {
   if (it._hay === undefined) {
@@ -450,7 +489,7 @@ function buildMatcher(raw) {
 }
 
 function applyFilter({ keepScroll = false } = {}) {
-  const src = S.tab === 'queue' ? S.qItems : S.localItems;
+  const src = itemsOf();
   const matcher = buildMatcher($('filter').value);
   $('filter').style.borderColor = matcher?.error ? 'var(--color-error)' : '';
   $('clearFilter').hidden = !$('filter').value;
@@ -464,12 +503,14 @@ function applyFilter({ keepScroll = false } = {}) {
   $('shown').textContent = src.length ? `${fmt(S.view.length)} / ${fmt(src.length)}` : '';
   const emptyText =
     S.tab === 'local'
-      ? 'No hay mensajes respaldados'
-      : !S.qpage
-        ? 'Cargá las colas y elegí una'
-        : !S.current
-          ? 'Elegí una cola de la izquierda'
-          : `Tocá "Ver (nack)" para leer hasta ${fmt(count())} mensajes`;
+      ? 'No hay respaldos: se crea uno en cada mover o ack'
+      : S.tab === 'file'
+        ? 'Abrí un .json con un array: cada elemento es un mensaje'
+        : !S.qpage
+          ? 'Cargá las colas y elegí una'
+          : !S.current
+            ? 'Elegí una cola de la izquierda'
+            : `Tocá "Ver (nack)" para leer hasta ${fmt(count())} mensajes`;
   $('emptyText').textContent = src.length && !S.view.length ? 'Ningún mensaje coincide con el filtro' : emptyText;
   $('empty').hidden = S.view.length > 0;
   renderDetail();
@@ -509,19 +550,25 @@ const relTime = (ts) => new Date(ts).toLocaleString('es', { dateStyle: 'short', 
 const fmtSize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1048576).toFixed(1)} MB`);
 
 function updateRow(row, it, i) {
-  const local = S.tab === 'local';
-  row._check.hidden = !local;
-  row._check.checked = local && S.checked.has(it.key);
+  row._check.checked = picks().has(it.key);
   row.classList.toggle('sel', i === S.sel);
+  row.classList.toggle('picked', row._check.checked);
   row._idx.textContent = it.idx;
 
-  if (local) {
+  if (S.tab === 'local') {
     row._t1.className = `tag tag--${it.status}`;
     row._t1.textContent = it.status;
     row._t2.className = 'tag';
     row._t2.textContent = it.op;
     row._rk.textContent = it.target ? `${it.source} → ${it.target}` : it.source;
     row._info.textContent = `${relTime(it.ts)} · ${fmtSize(it.size)}`;
+  } else if (S.tab === 'file') {
+    row._t1.className = 'tag';
+    row._t1.textContent = 'archivo';
+    row._t2.className = 'tag';
+    row._t2.textContent = '';
+    row._rk.textContent = it.routing_key || S.fileName;
+    row._info.textContent = `${fmtSize(it.size)}${it.properties?.content_type ? ' · ' + it.properties.content_type : ''}`;
   } else {
     row._t1.className = 'tag tag--redelivered';
     row._t1.textContent = it.redelivered ? 'redelivered' : '';
@@ -540,7 +587,9 @@ $('listInner').addEventListener('click', (ev) => {
   const row = ev.target.closest('.row');
   if (!row) return;
   const i = Number(row.dataset.index);
-  if (ev.target === row._check) {
+  // Click en la casilla, o Ctrl/Shift+click en la fila, selecciona.
+  if (ev.target === row._check || ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+    if (ev.target !== row._check) ev.preventDefault();
     toggleCheck(i, ev.shiftKey);
     return;
   }
@@ -557,30 +606,55 @@ function select(i) {
 
 function toggleCheck(i, range) {
   const it = S.view[i];
-  const on = !S.checked.has(it.key);
+  const set = picks();
+  const on = !set.has(it.key);
   const [a, b] = range && S.lastCheck >= 0 ? [Math.min(S.lastCheck, i), Math.max(S.lastCheck, i)] : [i, i];
   for (let k = a; k <= b; k++) {
-    if (on) S.checked.add(S.view[k].key);
-    else S.checked.delete(S.view[k].key);
+    if (on) set.add(S.view[k].key);
+    else set.delete(S.view[k].key);
   }
   S.lastCheck = i;
   list.refresh();
   renderSelection();
 }
 
+/** Contador de seleccionados y textos de los botones según la pestaña. */
 function renderSelection() {
-  if (S.tab !== 'local') return;
-  const n = S.checked.size;
-  $('selCount').textContent = n ? `${fmt(n)} seleccionados` : '';
-  $('republishSel').disabled = $('deleteSel').disabled = n === 0 || !!S.op;
-  const visibleChecked = S.view.length > 0 && S.view.every((it) => S.checked.has(it.key));
+  const set = picks();
+  const n = set.size;
+  const visibleChecked = S.view.length > 0 && S.view.every((it) => set.has(it.key));
   $('selAll').checked = visibleChecked;
-  $('selAll').indeterminate = !visibleChecked && S.view.some((it) => S.checked.has(it.key));
+  $('selAll').indeterminate = !visibleChecked && S.view.some((it) => set.has(it.key));
+  $('selAll').disabled = !S.view.length;
+  $('selCount').hidden = n === 0;
+  $('selCount').textContent = `${fmt(n)} seleccionados ✕`;
+  $('selCount').title = 'Quitar la selección';
+
+  const busyOp = !!S.op;
+  if (S.tab === 'queue') {
+    $('ack').textContent = n ? `Ack ${fmt(n)} sel.` : 'Ack N';
+    $('move').textContent = n ? `Mover ${fmt(n)} sel. →` : 'Mover N →';
+  } else if (S.tab === 'file') {
+    const visible = S.view.length;
+    $('publishFile').textContent = n ? `Publicar ${fmt(n)} sel. →` : `Publicar ${fmt(visible)} →`;
+    $('publishFile').disabled = busyOp || (!n && !visible);
+  } else {
+    // Sin selección re-publica todos los visibles; borrar exige selección explícita.
+    $('republishSel').textContent = n ? `Re-publicar ${fmt(n)} sel.…` : `Re-publicar ${fmt(S.view.length)}…`;
+    $('republishSel').disabled = busyOp || (!n && !S.view.length);
+    $('deleteSel').disabled = busyOp || n === 0;
+  }
 }
 
 $('selAll').onchange = () => {
   const on = $('selAll').checked;
-  for (const it of S.view) on ? S.checked.add(it.key) : S.checked.delete(it.key);
+  const set = picks();
+  for (const it of S.view) on ? set.add(it.key) : set.delete(it.key);
+  list.refresh();
+  renderSelection();
+};
+$('selCount').onclick = () => {
+  picks().clear();
   list.refresh();
   renderSelection();
 };
@@ -724,6 +798,8 @@ async function peek() {
     if (token !== S.peekToken || queue !== S.current) return;
     refreshExact([queue]);
     S.qItems = r.map(normQueueMsg);
+    // Las claves son posiciones de esta lectura: una selección anterior ya no aplica.
+    S.picks.queue.clear();
     S.sel = S.qItems.length ? 0 : -1;
     if (S.tab === 'queue') applyFilter();
     lastOp(`${fmt(r.length)} mensajes leídos de ${queue}`);
@@ -748,32 +824,43 @@ function showSkeleton(on, text = 'Cargando…') {
   }
 }
 
+/**
+ * Ready exactos (AMQP) de origen y destino. Devuelve el ready de origen o null si
+ * hay que abortar (ya avisó con un toast).
+ */
+async function checkQueues(source, target, btn) {
+  try {
+    const names = target ? [source, target] : [source];
+    const exact = await busy(btn, () => call('queues_ready', { conn: conn(), names }));
+    if (target && !(target in exact)) return toast.err(`La cola destino “${target}” no existe o no es accesible`), null;
+    if (!(source in exact)) return toast.err(`No se pudo leer “${source}”`), null;
+    refreshExact(names);
+    if (!exact[source]) return toast.info(`“${source}” no tiene mensajes ready`), null;
+    return exact[source];
+  } catch (err) {
+    toast.err(`No se pudo consultar la cola: ${err}`);
+    return null;
+  }
+}
+
+/** Ack/Mover: con mensajes seleccionados actúa sobre esos; si no, sobre los primeros N. */
 async function drain(target) {
   if (!S.current || S.op) return;
+  if (S.picks.queue.size) return drainSelected(target);
   const source = S.current;
   const asked = count();
 
   // Cantidad real: lo pedido acotado a lo que hay ready ahora (AMQP, sin el atraso
   // de las estadísticas). Así el diálogo no promete mover 100 si hay 5.
-  let ready;
-  try {
-    const names = target ? [source, target] : [source];
-    const exact = await busy($(target ? 'move' : 'ack'), () => call('queues_ready', { conn: conn(), names }));
-    if (target && !(target in exact)) return toast.err(`La cola destino “${target}” no existe o no es accesible`);
-    if (!(source in exact)) return toast.err(`No se pudo leer “${source}”`);
-    ready = exact[source];
-    refreshExact(names);
-  } catch (err) {
-    return toast.err(`No se pudo consultar la cola: ${err}`);
-  }
-  if (!ready) return toast.info(`“${source}” no tiene mensajes ready`);
+  const ready = await checkQueues(source, target, $(target ? 'move' : 'ack'));
+  if (ready == null) return;
   const n = Math.min(asked, ready);
   const note = asked > ready ? `\nPediste ${fmt(asked)}, pero la cola tiene ${fmt(ready)} ready.` : `\nLa cola tiene ${fmt(ready)} ready.`;
 
   const yes = await ask(
     target
-      ? { title: `Mover ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `De “${source}” a “${target}”.${note}\n\nCada lote se respalda localmente, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover' }
-      : { title: `Ack de ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `Se sacan de “${source}”.${note}\n\nQuedan respaldados localmente y se pueden re-publicar desde “Respaldo local”.`, ok: 'Sacar mensajes', danger: true }
+      ? { title: `Mover ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `De “${source}” a “${target}”.${note}\n\nSe guarda un respaldo nuevo de este envío, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover' }
+      : { title: `Ack de ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `Se sacan de “${source}”.${note}\n\nQuedan en un respaldo nuevo y se pueden volver a cargar desde “Último respaldo”.`, ok: 'Sacar mensajes', danger: true }
   );
   if (!yes) return;
 
@@ -799,9 +886,70 @@ async function drain(target) {
   // Lo leído ya no refleja la cola. Los contadores de origen y destino se toman
   // exactos por AMQP; un refresco completo de la página corregiría con datos viejos.
   S.qItems = [];
+  S.picks.queue.clear();
   applyFilter();
   refreshExact([source, target]);
-  refreshLocalCount();
+  showLatestBackup();
+}
+
+/**
+ * Mueve/ackea solo los seleccionados. El backend recorre el principio de la cola,
+ * los reconoce por huella y devuelve el resto a la cola en su orden.
+ */
+async function drainSelected(target) {
+  const source = S.current;
+  const chosen = pickedItems('queue');
+  const k = chosen.length;
+  if (!k) return;
+  if ((await checkQueues(source, target, $(target ? 'move' : 'ack'))) == null) return;
+  // Lo leído son los primeros mensajes de la cola: se recorre esa ventana más un margen.
+  const scan = S.qItems.length + 50;
+  const what = `${fmt(k)} ${k === 1 ? 'mensaje seleccionado' : 'mensajes seleccionados'}`;
+  const how = `\n\nSe recorren hasta ${fmt(scan)} mensajes del principio de la cola para encontrarlos; los no seleccionados vuelven a la cola en su orden. Se guarda un respaldo nuevo antes de cualquier ack.`;
+  const yes = await ask(
+    target
+      ? { title: `Mover ${what}`, body: `De “${source}” a “${target}”.${how}`, ok: 'Mover' }
+      : { title: `Ack de ${what}`, body: `Se sacan de “${source}”.${how}`, ok: 'Sacar mensajes', danger: true }
+  );
+  if (!yes) return;
+
+  startOp(target ? `Moviendo ${what} → ${target}` : `Ackeando ${what}`, k, { mode: 'run' });
+  showSkeleton(true, target ? `Moviendo seleccionados a ${target}…` : `Sacando seleccionados de ${source}…`);
+  try {
+    const r = await atLeast(
+      call('move_selected', { conn: conn(), source, target: target || null, fps: chosen.map((it) => it.fp), scan }),
+      MIN_ANIM_MS
+    );
+    const verb = target ? 'movidos' : 'ackeados';
+    if (r.failed.length) toast.err(`${fmt(r.ok)} ${verb}, falló: ${r.failed[0]}. Los fallidos siguen en origen.`);
+    else if (r.not_found) toast.info(`${fmt(r.ok)} de ${fmt(r.total)} ${verb}. ${fmt(r.not_found)} ya no estaban en la cola (los consumió otro o cambiaron).`);
+    else if (r.ok) {
+      toast.ok(`${fmt(r.ok)} seleccionados ${verb}${target ? ` a ${target}` : ''}`);
+      bunnyDash();
+    }
+    lastOp(`${fmt(r.ok)} seleccionados ${verb} de ${source}`);
+
+    // Saca de la lista los que se fueron (por huella, respetando duplicados); el
+    // resto sigue en la cola y queda visible.
+    const gone = new Map();
+    for (const fp of r.moved) gone.set(fp, (gone.get(fp) || 0) + 1);
+    const remaining = S.qItems.filter((it) => {
+      const c = gone.get(it.fp);
+      if (!c) return true;
+      gone.set(it.fp, c - 1);
+      return false;
+    });
+    S.qItems = remaining.map((it, i) => ({ ...it, key: i, idx: i + 1 }));
+    S.picks.queue.clear();
+  } catch (err) {
+    toast.err(`Error: ${err}. Lo procesado quedó en el respaldo local.`);
+  } finally {
+    showSkeleton(false);
+    endOp();
+  }
+  applyFilter({ keepScroll: true });
+  refreshExact([source, target]);
+  showLatestBackup();
 }
 
 $('peek').onclick = peek;
@@ -814,15 +962,95 @@ $('move').onclick = () => {
   drain(t);
 };
 
-// --- respaldo local ------------------------------------------------------------------
-async function loadLocal() {
-  showSkeleton(!S.localItems.length);
+// --- archivo JSON -------------------------------------------------------------------
+$('openFile').onclick = () => $('fileInput').click();
+$('fileInput').onchange = async () => {
+  const f = $('fileInput').files[0];
+  if (!f) return;
   try {
-    const r = await call('list_local');
-    S.localItems = r.map(normLocal);
+    let data = JSON.parse(await f.text());
+    if (!Array.isArray(data)) {
+      // Tolerancia: {"messages": [...]} también vale.
+      if (data && Array.isArray(data.messages)) data = data.messages;
+      else throw new Error('tiene que ser un array JSON: [ {...}, {...} ]');
+    }
+    S.fileItems = data.map(normFile);
+    S.fileName = f.name;
+    S.picks.file.clear();
+    $('fileName').textContent = `${f.name} · ${fmt(data.length)} mensajes`;
+    $('fileCount').textContent = data.length ? fmt(data.length) : '';
+    log('info', `archivo cargado: ${f.name} (${data.length} mensajes, ${f.size} bytes)`);
+    toast.ok(`${fmt(data.length)} mensajes cargados de ${f.name}`);
+    if (S.tab !== 'file') setTab('file');
+    else applyFilter();
+    if (!$('fileTarget').value && S.current) $('fileTarget').value = S.current;
+  } catch (err) {
+    toast.err(`No se pudo leer ${f.name}: ${err.message ?? err}`);
+  } finally {
+    $('fileInput').value = '';
+  }
+};
+
+$('publishFile').onclick = async () => {
+  if (S.op) return;
+  const queue = $('fileTarget').value.trim();
+  if (!queue) return toast.err('Elegí la cola destino');
+  // Seleccionados, o todos los que deja ver el filtro.
+  const chosen = S.picks.file.size ? pickedItems('file') : S.view;
+  const k = chosen.length;
+  if (!k) return;
+  const yes = await ask({
+    title: `Publicar ${fmt(k)} ${k === 1 ? 'mensaje' : 'mensajes'} en “${queue}”`,
+    body: `Desde ${S.fileName}${S.picks.file.size ? ' (seleccionados)' : $('filter').value ? ' (los que pasan el filtro)' : ''}.\n\nPersistentes y con content_type application/json, salvo que el elemento traiga sus propias properties. Con confirmación del broker.`,
+    ok: 'Publicar',
+  });
+  if (!yes) return;
+  startOp(`Publicando en ${queue}`, k, { mode: 'hop' });
+  try {
+    const r = await atLeast(
+      call('publish_messages', { conn: conn(), queue, messages: chosen.map((it) => ({ payload: it.payload, properties: it.properties })) }),
+      MIN_ANIM_MS
+    );
+    if (r.failed.length) toast.err(`${fmt(r.ok)} de ${fmt(r.total)} publicados; falló: ${r.failed[0]}`);
+    else {
+      toast.ok(`${fmt(r.ok)} mensajes publicados en ${queue}`);
+      bunnyDash();
+    }
+    lastOp(`${fmt(r.ok)} publicados desde ${S.fileName} en ${queue}`);
+    S.picks.file.clear();
+  } catch (err) {
+    toast.err(`No se pudo publicar: ${err}`);
+  } finally {
+    endOp();
+  }
+  applyFilter({ keepScroll: true });
+  refreshExact([queue]);
+};
+
+// --- respaldo local (uno por envío; la pestaña muestra el último) ---------------------
+const bkpLabel = (b) =>
+  `${relTime(b.ts)} · ${b.op === 'move' ? 'mover' : 'ack'} · ${b.source}${b.target ? ` → ${b.target}` : ''} · ${fmt(b.count)} msgs`;
+
+/** Lista de respaldos para el selector; el badge muestra el tamaño del último. */
+async function loadBackups() {
+  const runs = await call('list_backups', undefined, { quiet: true });
+  S.backups = runs;
+  if (!runs.some((b) => b.id === S.backupId)) S.backupId = runs[0]?.id ?? null;
+  const sel = $('bkpSelect');
+  sel.replaceChildren(...runs.map((b, i) => new Option(`${i === 0 ? 'Último · ' : ''}${bkpLabel(b)}`, b.id)));
+  if (!runs.length) sel.appendChild(new Option('Sin respaldos todavía', ''));
+  sel.value = S.backupId ?? '';
+  $('localCount').textContent = runs[0]?.count ? fmt(runs[0].count) : '';
+}
+
+async function loadLocal() {
+  showSkeleton(!S.localItems.length, 'Leyendo respaldo…');
+  try {
+    await loadBackups();
+    const r = S.backupId ? await call('load_backup', { id: S.backupId }) : { entries: [] };
+    S.localItems = r.entries.map(normLocal);
     const keys = new Set(S.localItems.map((it) => it.key));
-    for (const k of S.checked) if (!keys.has(k)) S.checked.delete(k);
-    $('localCount').textContent = r.length ? fmt(r.length) : '';
+    for (const k of S.picks.local) if (!keys.has(k)) S.picks.local.delete(k);
     if (S.tab === 'local') applyFilter({ keepScroll: true });
   } catch (err) {
     toast.err(`No se pudo leer el respaldo: ${err}`);
@@ -831,36 +1059,41 @@ async function loadLocal() {
   }
 }
 
-async function refreshLocalCount() {
-  if (S.tab === 'local') return loadLocal();
-  try {
-    const r = await call('list_local', undefined, { quiet: true });
-    S.localItems = r.map(normLocal);
-    $('localCount').textContent = r.length ? fmt(r.length) : '';
-  } catch {}
+/** Tras un envío nuevo, la pestaña vuelve a mostrar el último respaldo. */
+function showLatestBackup() {
+  S.backupId = null;
+  S.picks.local.clear();
+  if (S.tab === 'local') loadLocal();
+  else loadBackups().catch(() => {});
 }
 
-const checkedRefs = () =>
-  [...S.checked].map((k) => {
-    const i = k.lastIndexOf(':');
-    return { batch: k.slice(0, i), n: Number(k.slice(i + 1)) };
-  });
+$('bkpSelect').onchange = () => {
+  S.backupId = $('bkpSelect').value || null;
+  S.picks.local.clear();
+  S.localItems = [];
+  loadLocal();
+};
+
+const refsOf = (items) => items.map((it) => ({ batch: it.batch, n: it.n }));
 
 $('republishSel').onclick = async () => {
-  const items = checkedRefs();
+  // Seleccionados, o todos los visibles del respaldo.
+  const chosen = S.picks.local.size ? pickedItems('local') : S.view;
+  if (!chosen.length) return;
   const queue = await ask({
-    title: `Re-publicar ${fmt(items.length)} mensajes`,
-    body: 'Se publican con sus properties y headers originales, con confirmación del broker.',
+    title: `Re-publicar ${fmt(chosen.length)} mensajes`,
+    body: 'Se publican con sus properties y headers originales, con confirmación del broker. Por defecto, en la cola de donde salieron.',
     ok: 'Re-publicar',
-    queue: S.current || '',
+    queue: chosen[0].source || S.current || '',
   });
   if (!queue) return;
-  startOp(`Re-publicando en ${queue}`, items.length);
+  startOp(`Re-publicando en ${queue}`, chosen.length, { mode: 'hop' });
   try {
-    const n = await call('republish', { conn: conn(), items, queue });
+    const n = await atLeast(call('republish', { conn: conn(), items: refsOf(chosen), queue }), MIN_ANIM_MS);
     toast.ok(`${fmt(n)} mensajes re-publicados en ${queue}`);
+    bunnyDash();
     lastOp(`${fmt(n)} re-publicados en ${queue}`);
-    S.checked.clear();
+    S.picks.local.clear();
   } catch (err) {
     toast.err(`Re-publicación interrumpida: ${err}`);
   } finally {
@@ -871,10 +1104,11 @@ $('republishSel').onclick = async () => {
 };
 
 $('deleteSel').onclick = async () => {
-  const items = checkedRefs();
-  const pending = S.localItems.filter((it) => S.checked.has(it.key) && it.status !== 'done' && it.status !== 'republished').length;
+  const chosen = pickedItems('local');
+  if (!chosen.length) return;
+  const pending = chosen.filter((it) => it.status !== 'done' && it.status !== 'republished').length;
   const yes = await ask({
-    title: `Borrar ${fmt(items.length)} respaldos`,
+    title: `Borrar ${fmt(chosen.length)} del respaldo`,
     body: pending
       ? `Atención: ${fmt(pending)} no están en estado done/republished.\nEsto no se puede deshacer.`
       : 'Esto no se puede deshacer.',
@@ -883,9 +1117,9 @@ $('deleteSel').onclick = async () => {
   });
   if (!yes) return;
   try {
-    const n = await call('delete_local', { items });
-    toast.ok(`${fmt(n)} respaldos borrados`);
-    S.checked.clear();
+    const n = await call('delete_local', { items: refsOf(chosen) });
+    toast.ok(`${fmt(n)} mensajes borrados del respaldo`);
+    S.picks.local.clear();
   } catch (err) {
     toast.err(`No se pudo borrar: ${err}`);
   }
@@ -905,9 +1139,11 @@ function setTab(t) {
   S.tab = t;
   S.sel = -1;
   S.view = [];
+  S.lastCheck = -1;
   for (const b of document.querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === t);
   placeIndicator();
   $('queueActions').hidden = t !== 'queue';
+  $('fileActions').hidden = t !== 'file';
   $('localActions').hidden = t !== 'local';
   applyFilter();
   if (t === 'local') loadLocal();
@@ -978,10 +1214,10 @@ document.addEventListener('keydown', (ev) => {
   } else if (!inField && (ev.key === 'ArrowUp' || ev.key === 'k')) {
     ev.preventDefault();
     select(Math.max(0, S.sel - 1));
-  } else if (!inField && ev.key === ' ' && S.tab === 'local' && S.sel >= 0) {
+  } else if (!inField && ev.key === ' ' && S.sel >= 0) {
     ev.preventDefault();
     toggleCheck(S.sel, ev.shiftKey);
-  } else if (!inField && mod && ev.key.toLowerCase() === 'a' && S.tab === 'local') {
+  } else if (!inField && mod && ev.key.toLowerCase() === 'a') {
     ev.preventDefault();
     $('selAll').checked = true;
     $('selAll').onchange();
@@ -1041,5 +1277,5 @@ requestAnimationFrame(placeIndicator);
 window.addEventListener('resize', placeIndicator);
 renderQueues();
 applyFilter();
-refreshLocalCount();
+loadBackups().catch(() => {});
 setConn('', `Perfil ${profile()?.name ?? ''} — sin conectar`);

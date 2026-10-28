@@ -12,14 +12,16 @@ use lapin::{
     types::{AMQPValue, FieldTable},
     BasicProperties, Channel, Connection, ConnectionProperties,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
+
+mod backup;
 
 type R<T> = Result<T, String>;
 
@@ -97,29 +99,6 @@ impl Conn {
 
 // --- respaldo local -----------------------------------------------------------
 
-/// Un lote de mensajes sacados de una cola. Se escribe (con fsync) antes de
-/// cualquier ack en origen y se reescribe al cambiar el estado de sus entradas.
-#[derive(Serialize, Deserialize)]
-struct Batch {
-    id: String,
-    ts: u64,
-    op: String, // "ack" | "move"
-    source: String,
-    target: Option<String>,
-    entries: Vec<Entry>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Entry {
-    n: u32,
-    status: String, // "pending" | "done" | "error" | "republished"
-    error: Option<String>,
-    routing_key: String,
-    exchange: String,
-    properties: BasicProperties,
-    payload_b64: String,
-}
-
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
@@ -130,27 +109,128 @@ fn backup_dir(app: &AppHandle) -> R<PathBuf> {
     Ok(dir)
 }
 
-fn batch_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.batch.json"))
-}
-
-/// tmp + fsync + rename: o queda el archivo completo o el anterior.
-fn save_batch(dir: &Path, b: &Batch) -> R<()> {
-    use std::io::Write;
-    let tmp = dir.join(format!("{}.tmp", b.id));
-    let mut f = std::fs::File::create(&tmp).map_err(e)?;
-    f.write_all(&serde_json::to_vec(b).map_err(e)?).map_err(e)?;
-    f.sync_all().map_err(e)?;
-    std::fs::rename(&tmp, batch_path(dir, &b.id)).map_err(e)
-}
-
-fn load_batch(dir: &Path, id: &str) -> R<Batch> {
-    serde_json::from_slice(&std::fs::read(batch_path(dir, id)).map_err(e)?).map_err(e)
-}
-
 /// Corre IO de disco fuera del runtime async (y del hilo principal).
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) -> R<T> {
     tokio::task::spawn_blocking(f).await.map_err(e)?
+}
+
+/// fsync dentro de un comando async sin bloquear el resto del runtime.
+fn sync_io<T>(f: impl FnOnce() -> R<T>) -> R<T> {
+    tokio::task::block_in_place(f)
+}
+
+/// Abre el archivo de respaldo de una ejecución nueva. Devuelve (writer, id).
+fn new_run(
+    app: &AppHandle,
+    op: &str,
+    source: &str,
+    target: &Option<String>,
+) -> R<(backup::Writer, String)> {
+    let header = backup::Header {
+        id: format!("{}-{op}", now_ms()),
+        ts: now_ms(),
+        op: op.into(),
+        source: source.into(),
+        target: target.clone(),
+    };
+    log::info!("respaldo nuevo: {}", header.id);
+    let dir = backup_dir(app)?;
+    let w = sync_io(|| backup::Writer::create(&dir, &header))?;
+    Ok((w, header.id))
+}
+
+fn entry_of(n: u32, d: &Delivery) -> backup::Entry {
+    backup::Entry {
+        n,
+        status: "pending".into(),
+        error: None,
+        routing_key: d.routing_key.to_string(),
+        exchange: d.exchange.to_string(),
+        properties: d.properties.clone(),
+        payload_b64: B64.encode(&d.data),
+        republished_to: None,
+    }
+}
+
+/// Huella de un mensaje para reconocerlo entre lecturas (Ver → Mover seleccionados).
+/// No incluye `redelivered` ni headers que cambian al reencolar.
+fn fingerprint(d: &Delivery) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let p = &d.properties;
+    let s = |v: &Option<lapin::types::ShortString>| v.as_ref().map(|x| x.as_str().to_string());
+    d.routing_key.as_str().hash(&mut h);
+    d.data.hash(&mut h);
+    s(p.message_id()).hash(&mut h);
+    s(p.correlation_id()).hash(&mut h);
+    s(p.content_type()).hash(&mut h);
+    p.timestamp().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+// --- JSON → AMQP (mensajes cargados desde archivo) ------------------------------
+
+fn json_amqp(v: &Value) -> AMQPValue {
+    match v {
+        Value::Null => AMQPValue::Void,
+        Value::Bool(b) => AMQPValue::Boolean(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => AMQPValue::LongLongInt(i),
+            None => AMQPValue::Double(n.as_f64().unwrap_or_default()),
+        },
+        Value::String(s) => AMQPValue::LongString(s.as_str().into()),
+        Value::Array(a) => AMQPValue::FieldArray(a.iter().map(json_amqp).collect::<Vec<_>>().into()),
+        Value::Object(o) => AMQPValue::FieldTable(json_table(o)),
+    }
+}
+
+fn json_table(o: &Map<String, Value>) -> FieldTable {
+    let mut t = FieldTable::default();
+    for (k, v) in o {
+        t.insert(k.as_str().into(), json_amqp(v));
+    }
+    t
+}
+
+/// Properties a partir del JSON (mismos nombres que muestra la UI). Persistente por defecto.
+fn props_from_json(p: &Value) -> BasicProperties {
+    let s = |k: &str| p.get(k).and_then(Value::as_str).map(lapin::types::ShortString::from);
+    let u = |k: &str| p.get(k).and_then(Value::as_u64);
+    let mut b = BasicProperties::default().with_delivery_mode(u("delivery_mode").unwrap_or(2) as u8);
+    if let Some(v) = s("content_type") {
+        b = b.with_content_type(v);
+    }
+    if let Some(v) = s("content_encoding") {
+        b = b.with_content_encoding(v);
+    }
+    if let Some(v) = u("priority") {
+        b = b.with_priority(v as u8);
+    }
+    if let Some(v) = s("correlation_id") {
+        b = b.with_correlation_id(v);
+    }
+    if let Some(v) = s("reply_to") {
+        b = b.with_reply_to(v);
+    }
+    if let Some(v) = s("expiration") {
+        b = b.with_expiration(v);
+    }
+    if let Some(v) = s("message_id") {
+        b = b.with_message_id(v);
+    }
+    if let Some(v) = u("timestamp") {
+        b = b.with_timestamp(v);
+    }
+    if let Some(v) = s("type") {
+        b = b.with_type(v);
+    }
+    if let Some(v) = s("app_id") {
+        b = b.with_app_id(v);
+    }
+    if let Some(Value::Object(h)) = p.get("headers") {
+        b = b.with_headers(json_table(h));
+    }
+    b
 }
 
 // --- conversión para la UI -------------------------------------------------------
@@ -226,6 +306,7 @@ fn delivery_json(d: &Delivery) -> Value {
         "routing_key": d.routing_key.as_str(),
         "exchange": d.exchange.as_str(),
         "redelivered": d.redelivered,
+        "fp": fingerprint(d),
         "size": d.data.len(),
         "properties": props_json(&d.properties),
         "payload": payload,
@@ -518,11 +599,98 @@ async fn peek(
     Ok(out)
 }
 
-/// Saca hasta `count` mensajes de `source` en lotes. Por lote:
-/// 1. recibe (sin ack), 2. guarda el lote en disco con fsync,
-/// 3. si hay `target`, publica con confirms + mandatory y espera los confirms,
-/// 4. recién entonces ackea el origen. Ante cualquier fallo los mensajes no
-///    ackeados vuelven a la cola y el lote queda en disco marcado.
+/// Publica en vuelo al default exchange → `queue` (mandatory) y después espera los
+/// confirms en orden. Devuelve, por mensaje, None si el broker lo confirmó.
+async fn publish_all(
+    ch: &Channel,
+    queue: &str,
+    msgs: Vec<(&[u8], BasicProperties)>,
+) -> Vec<Option<String>> {
+    let mut pending = Vec::with_capacity(msgs.len());
+    for (data, props) in msgs {
+        pending.push(
+            ch.basic_publish(
+                "",
+                queue,
+                BasicPublishOptions { mandatory: true, ..Default::default() },
+                data,
+                props,
+            )
+            .await,
+        );
+    }
+    let mut out = Vec::with_capacity(pending.len());
+    for p in pending {
+        out.push(match p {
+            Err(err) => Some(e(err)),
+            Ok(confirm) => match confirm.await {
+                Ok(Confirmation::Ack(None)) => None,
+                Ok(Confirmation::Ack(Some(r))) => {
+                    Some(format!("devuelto por el broker: {}", r.reply_text.as_str()))
+                }
+                Ok(_) => Some("broker nack en publish".into()),
+                Err(err) => Some(e(err)),
+            },
+        });
+    }
+    out
+}
+
+/// Respalda (fsync) un grupo de entregas, las publica en `target` si hay, y ackea en
+/// origen solo las confirmadas; las fallidas se nackean con requeue. Devuelve los
+/// errores por entrega. `individual_acks` cuando las entregas no son consecutivas.
+async fn process_group(
+    ch: &Channel,
+    w: &mut backup::Writer,
+    base: u32,
+    ds: &[&Delivery],
+    target: &Option<String>,
+    individual_acks: bool,
+) -> R<Vec<Option<String>>> {
+    let entries = ds.iter().enumerate().map(|(i, d)| entry_of(base + i as u32, d)).collect();
+    // Sin respaldo en disco no se ackea nada.
+    sync_io(|| w.entries(entries))?;
+
+    let errs = match target {
+        Some(t) => {
+            let msgs = ds.iter().map(|d| (&d.data[..], d.properties.clone())).collect();
+            publish_all(ch, t, msgs).await
+        }
+        None => vec![None; ds.len()],
+    };
+
+    if !individual_acks && errs.iter().all(Option::is_none) {
+        // Entregas consecutivas: un solo ack múltiple.
+        let last = ds.last().map(|d| d.delivery_tag).unwrap_or_default();
+        ch.basic_ack(last, BasicAckOptions { multiple: true }).await.map_err(e)?;
+    } else {
+        for (d, err) in ds.iter().zip(&errs) {
+            let r = match err {
+                None => ch.basic_ack(d.delivery_tag, BasicAckOptions::default()).await,
+                Some(_) => {
+                    let opts = BasicNackOptions { multiple: false, requeue: true };
+                    ch.basic_nack(d.delivery_tag, opts).await
+                }
+            };
+            r.map_err(e)?;
+        }
+    }
+
+    let upd = errs
+        .iter()
+        .enumerate()
+        .map(|(i, err)| match err {
+            None => (base + i as u32, "done", None),
+            Some(msg) => (base + i as u32, "error", Some(format!("{msg} (sigue en origen)"))),
+        })
+        .collect();
+    sync_io(|| w.status(upd, None))?;
+    Ok(errs)
+}
+
+/// Saca hasta `count` mensajes de `source` en lotes. Por lote: recibe (sin ack),
+/// respalda con fsync, publica en `target` (si hay) con confirms + mandatory y
+/// recién entonces ackea el origen. Cada ejecución crea su propio archivo de respaldo.
 #[tauri::command]
 async fn drain(
     app: AppHandle,
@@ -533,7 +701,6 @@ async fn drain(
     count: u32,
 ) -> R<Value> {
     state.cancel.store(false, Ordering::SeqCst);
-    let dir = backup_dir(&app)?;
     let op = if target.is_some() { "move" } else { "ack" };
     log::info!("{op} \"{source}\" → {target:?} count={count} {}", conn.desc());
     let started = std::time::Instant::now();
@@ -544,7 +711,7 @@ async fn drain(
     }
     let total = ready_count(&conn, &state, &source).await?.min(count);
     if total == 0 {
-        return Ok(json!({ "ok": 0, "total": 0, "failed": [], "cancelled": false }));
+        return Ok(json!({ "ok": 0, "total": 0, "failed": [], "cancelled": false, "backup": null }));
     }
 
     let ch = channel(&state, &conn).await?;
@@ -557,7 +724,8 @@ async fn drain(
         .await
         .map_err(e)?;
 
-    let (mut ok, mut failed, mut seq) = (0u32, Vec::<String>::new(), 0u32);
+    let (mut ok, mut failed, mut seen) = (0u32, Vec::<String>::new(), 0u32);
+    let mut run: Option<(backup::Writer, String)> = None;
     progress(&app, op, 0, total);
 
     let result: R<()> = async {
@@ -573,103 +741,22 @@ async fn drain(
             if ds.is_empty() {
                 break;
             }
-
-            let batch = Batch {
-                id: format!("{}-{seq:04}", now_ms()),
-                ts: now_ms(),
-                op: op.into(),
-                source: source.clone(),
-                target: target.clone(),
-                entries: ds
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| Entry {
-                        n: i as u32,
-                        status: "pending".into(),
-                        error: None,
-                        routing_key: d.routing_key.to_string(),
-                        exchange: d.exchange.to_string(),
-                        properties: d.properties.clone(),
-                        payload_b64: B64.encode(&d.data),
-                    })
-                    .collect(),
-            };
-            seq += 1;
-            // Sin respaldo en disco no se ackea nada (los mensajes vuelven a la cola).
-            let (d2, batch) = (dir.clone(), batch);
-            let mut batch = blocking(move || save_batch(&d2, &batch).map(|_| batch)).await?;
-            log::debug!("{op}: lote {} con {} mensajes respaldado", batch.id, ds.len());
-
-            // Publica todo el lote en vuelo y después espera los confirms en orden.
-            let mut errs: Vec<Option<String>> = vec![None; ds.len()];
-            if let Some(t) = &target {
-                let mut pending = Vec::with_capacity(ds.len());
-                for d in &ds {
-                    pending.push(
-                        ch.basic_publish(
-                            "",
-                            t,
-                            BasicPublishOptions { mandatory: true, ..Default::default() },
-                            &d.data,
-                            d.properties.clone(),
-                        )
-                        .await,
-                    );
-                }
-                for (i, p) in pending.into_iter().enumerate() {
-                    errs[i] = match p {
-                        Err(err) => Some(e(err)),
-                        Ok(confirm) => match confirm.await {
-                            Ok(Confirmation::Ack(None)) => None,
-                            Ok(Confirmation::Ack(Some(r))) => {
-                                Some(format!("devuelto por el broker: {}", r.reply_text.as_str()))
-                            }
-                            Ok(_) => Some("broker nack en publish".into()),
-                            Err(err) => Some(e(err)),
-                        },
-                    };
-                }
+            if run.is_none() {
+                run = Some(new_run(&app, op, &source, &target)?);
             }
-
-            if errs.iter().all(Option::is_none) {
-                let last = ds.last().unwrap().delivery_tag;
-                ch.basic_ack(last, BasicAckOptions { multiple: true }).await.map_err(e)?;
-            } else {
-                let n_err = errs.iter().filter(|x| x.is_some()).count();
-                log::warn!(
-                    "{op}: lote {} con {n_err} fallos de publish, primero: {:?}",
-                    batch.id,
-                    errs.iter().flatten().next()
-                );
-                for (d, err) in ds.iter().zip(&errs) {
-                    let _ = match err {
-                        None => ch.basic_ack(d.delivery_tag, BasicAckOptions::default()).await,
-                        Some(_) => {
-                            ch.basic_nack(
-                                d.delivery_tag,
-                                BasicNackOptions { multiple: false, requeue: true },
-                            )
-                            .await
-                        }
-                    };
-                }
-            }
-
-            for (entry, err) in batch.entries.iter_mut().zip(errs) {
+            let (w, _) = run.as_mut().unwrap();
+            let refs: Vec<&Delivery> = ds.iter().collect();
+            let errs = process_group(&ch, w, seen, &refs, &target, false).await?;
+            seen += ds.len() as u32;
+            for err in errs {
                 match err {
-                    None => {
-                        entry.status = "done".into();
-                        ok += 1;
-                    }
-                    Some(msg) => {
-                        entry.status = "error".into();
-                        entry.error = Some(format!("{msg} (sigue en origen)"));
-                        failed.push(msg);
-                    }
+                    None => ok += 1,
+                    Some(msg) => failed.push(msg),
                 }
             }
-            let d2 = dir.clone();
-            blocking(move || save_batch(&d2, &batch)).await?;
+            if !failed.is_empty() {
+                log::warn!("{op}: {} fallos de publish, primero: {}", failed.len(), failed[0]);
+            }
             progress(&app, op, ok, total);
         }
         Ok(())
@@ -691,7 +778,166 @@ async fn drain(
         "total": total,
         "failed": failed,
         "cancelled": state.cancel.load(Ordering::SeqCst),
+        "backup": run.map(|(_, id)| id),
     }))
+}
+
+/// Mueve (o ackea, sin `target`) solo los mensajes elegidos en la UI. Recorre la
+/// cola desde el principio hasta `scan` mensajes y los reconoce por su huella
+/// (`fps`, con repeticiones si hay duplicados). Los no elegidos se quedan sin ack y
+/// vuelven a la cola al cerrar el canal, en su orden.
+#[tauri::command]
+async fn move_selected(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conn: Conn,
+    source: String,
+    target: Option<String>,
+    fps: Vec<String>,
+    scan: u32,
+) -> R<Value> {
+    let op = if target.is_some() { "move" } else { "ack" };
+    let wanted = fps.len() as u32;
+    log::info!(
+        "{op} seleccionados \"{source}\" → {target:?}: {wanted} elegidos, scan={scan} {}",
+        conn.desc()
+    );
+    if let Some(t) = &target {
+        ready_count(&conn, &state, t).await?;
+    }
+    let scan = ready_count(&conn, &state, &source).await?.min(scan).min(MAX_PEEK);
+    if scan == 0 || wanted == 0 {
+        return Ok(json!({ "ok": 0, "total": wanted, "not_found": wanted, "moved": [], "failed": [], "backup": null }));
+    }
+
+    let ch = channel(&state, &conn).await?;
+    if target.is_some() {
+        ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
+    }
+    ch.basic_qos(scan.min(u16::MAX as u32) as u16, BasicQosOptions::default())
+        .await
+        .map_err(e)?;
+    let mut consumer = ch
+        .basic_consume(&source, "", BasicConsumeOptions::default(), FieldTable::default())
+        .await
+        .map_err(e)?;
+
+    let mut want: std::collections::HashMap<String, u32> = Default::default();
+    for fp in fps {
+        *want.entry(fp).or_default() += 1;
+    }
+    let mut left = wanted;
+    let (mut moved, mut failed) = (Vec::<String>::new(), Vec::<String>::new());
+    let mut backup_id = None;
+    progress(&app, op, 0, wanted);
+
+    let result: R<()> = async {
+        let (mut picked, mut picked_fp) = (Vec::<Delivery>::new(), Vec::<String>::new());
+        // Lo recorrido y no elegido se retiene sin ack hasta cerrar el canal, así
+        // vuelve todo junto y en orden.
+        let mut held = Vec::new();
+        let mut seen = 0;
+        while seen < scan && left > 0 {
+            let Some(d) = next(&mut consumer).await? else { break };
+            seen += 1;
+            let f = fingerprint(&d);
+            match want.get_mut(&f) {
+                Some(c) if *c > 0 => {
+                    *c -= 1;
+                    left -= 1;
+                    picked.push(d);
+                    picked_fp.push(f);
+                }
+                _ => held.push(d),
+            }
+        }
+        log::info!(
+            "{op} seleccionados: recorridos {seen}, encontrados {}/{wanted}",
+            picked.len()
+        );
+        if picked.is_empty() {
+            return Ok(());
+        }
+        let (mut w, id) = new_run(&app, op, &source, &target)?;
+        backup_id = Some(id);
+        for (i, group) in picked.chunks(CHUNK).enumerate() {
+            let refs: Vec<&Delivery> = group.iter().collect();
+            let base = i * CHUNK;
+            let errs = process_group(&ch, &mut w, base as u32, &refs, &target, true).await?;
+            for (j, err) in errs.into_iter().enumerate() {
+                match err {
+                    None => moved.push(picked_fp[base + j].clone()),
+                    Some(msg) => failed.push(msg),
+                }
+            }
+            progress(&app, op, moved.len() as u32, wanted);
+        }
+        drop(held);
+        Ok(())
+    }
+    .await;
+
+    // Cerrar el canal reencola todo lo que quedó sin ack (no elegidos y fallidos).
+    let _ = ch.close(200, "ok").await;
+    log::info!(
+        "{op} seleccionados \"{source}\": {}/{wanted} ok, {} fallidos, {left} no encontrados{}",
+        moved.len(),
+        failed.len(),
+        result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
+    );
+    result?;
+    Ok(json!({
+        "ok": moved.len(),
+        "total": wanted,
+        "not_found": left,
+        "moved": moved,
+        "failed": failed,
+        "backup": backup_id,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PubMsg {
+    payload: String,
+    #[serde(default)]
+    properties: Value,
+}
+
+/// Publica en `queue` mensajes cargados desde un archivo JSON, con confirms.
+#[tauri::command]
+async fn publish_messages(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conn: Conn,
+    queue: String,
+    messages: Vec<PubMsg>,
+) -> R<Value> {
+    let total = messages.len() as u32;
+    log::info!("publish_messages → \"{queue}\": {total} mensajes {}", conn.desc());
+    ready_count(&conn, &state, &queue).await?;
+    let ch = channel(&state, &conn).await?;
+    ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
+    let (mut ok, mut failed) = (0u32, Vec::<String>::new());
+    progress(&app, "publish", 0, total);
+    for group in messages.chunks(500) {
+        let msgs = group
+            .iter()
+            .map(|m| (m.payload.as_bytes(), props_from_json(&m.properties)))
+            .collect();
+        for err in publish_all(&ch, &queue, msgs).await {
+            match err {
+                None => ok += 1,
+                Some(msg) => failed.push(msg),
+            }
+        }
+        progress(&app, "publish", ok, total);
+        if !failed.is_empty() {
+            break;
+        }
+    }
+    let _ = ch.close(200, "ok").await;
+    log::info!("publish_messages → \"{queue}\": {ok}/{total} ok, {} fallidos", failed.len());
+    Ok(json!({ "ok": ok, "total": total, "failed": failed }))
 }
 
 #[tauri::command]
@@ -699,42 +945,61 @@ fn cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
 
+/// Respaldos disponibles (uno por ejecución), del más reciente al más viejo.
 #[tauri::command]
-async fn list_local(app: AppHandle) -> R<Vec<Value>> {
+async fn list_backups(app: AppHandle) -> R<Vec<Value>> {
     let dir = backup_dir(&app)?;
     blocking(move || {
-        let mut batches: Vec<Batch> = std::fs::read_dir(&dir)
-            .map_err(e)?
-            .filter_map(|entry| {
-                let p = entry.ok()?.path();
-                p.to_str()?.ends_with(".batch.json").then_some(())?;
-                match std::fs::read(&p).map_err(e).and_then(|b| serde_json::from_slice(&b).map_err(e)) {
-                    Ok(b) => Some(b),
-                    Err(err) => {
-                        log::warn!("respaldo ilegible, se ignora: {} ({err})", p.display());
-                        None
-                    }
-                }
-            })
-            .collect();
-        batches.sort_by(|a, b| b.id.cmp(&a.id));
         let mut out = vec![];
-        for b in &batches {
-            for en in &b.entries {
+        for id in backup::ids(&dir)?.into_iter().take(50) {
+            match backup::read(&backup::path(&dir, &id)) {
+                Ok(run) => {
+                    let count = |s: &str| run.entries.iter().filter(|en| en.status == s).count();
+                    out.push(json!({
+                        "id": id, "ts": run.header.ts, "op": run.header.op,
+                        "source": run.header.source, "target": run.header.target,
+                        "count": run.entries.len(), "done": count("done"),
+                        "error": count("error"), "pending": count("pending"),
+                        "republished": count("republished"),
+                    }));
+                }
+                Err(err) => log::warn!("respaldo ilegible {id}: {err}"),
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Entradas de un respaldo (`id`), o del más reciente si no se indica.
+#[tauri::command]
+async fn load_backup(app: AppHandle, id: Option<String>) -> R<Value> {
+    let dir = backup_dir(&app)?;
+    blocking(move || {
+        let Some(id) = id.or_else(|| backup::ids(&dir).ok()?.into_iter().next()) else {
+            return Ok(json!({ "id": null, "entries": [] }));
+        };
+        let run = backup::read(&backup::path(&dir, &id))?;
+        let h = &run.header;
+        let entries: Vec<Value> = run
+            .entries
+            .iter()
+            .map(|en| {
                 let raw = B64.decode(&en.payload_b64).unwrap_or_default();
                 let (payload, binary) = payload_text(&raw);
-                out.push(json!({
-                    "batch": b.id, "n": en.n, "ts": b.ts, "op": b.op,
-                    "source": b.source, "target": b.target,
+                json!({
+                    "batch": id, "n": en.n, "ts": h.ts, "op": h.op,
+                    "source": h.source,
+                    "target": en.republished_to.clone().or_else(|| h.target.clone()),
                     "status": en.status, "error": en.error,
                     "routing_key": en.routing_key, "exchange": en.exchange,
                     "size": raw.len(),
                     "properties": props_json(&en.properties),
                     "payload": payload, "binary": binary,
-                }));
-            }
-        }
-        Ok(out)
+                })
+            })
+            .collect();
+        Ok(json!({ "id": id, "entries": entries }))
     })
     .await
 }
@@ -745,7 +1010,15 @@ struct EntryRef {
     n: u32,
 }
 
-/// Re-publica entradas del respaldo a una cola (recuperación manual).
+fn group_refs(items: Vec<EntryRef>) -> std::collections::BTreeMap<String, Vec<u32>> {
+    let mut by_run: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+    for it in items {
+        by_run.entry(it.batch).or_default().push(it.n);
+    }
+    by_run
+}
+
+/// Re-publica entradas de un respaldo a una cola, con sus properties originales.
 #[tauri::command]
 async fn republish(
     app: AppHandle,
@@ -759,45 +1032,40 @@ async fn republish(
     let ch = channel(&state, &conn).await?;
     ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
 
-    // Agrupa por lote para leer/escribir cada archivo una sola vez.
-    let mut by_batch: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
-    for it in items {
-        by_batch.entry(it.batch).or_default().push(it.n);
-    }
-    let (total, mut done) = (by_batch.values().map(Vec::len).sum::<usize>() as u32, 0u32);
+    let total = items.len() as u32;
+    let mut done = 0u32;
+    log::info!("republish → \"{queue}\": {total} entradas");
     let result: R<()> = async {
-        for (id, ns) in by_batch {
+        for (id, ns) in group_refs(items) {
             let (d2, id2) = (dir.clone(), id.clone());
-            let mut b = blocking(move || load_batch(&d2, &id2)).await?;
-            let mut err = None;
-            for en in b.entries.iter_mut().filter(|en| ns.contains(&en.n)) {
-                let data = B64.decode(&en.payload_b64).map_err(e)?;
-                let conf = ch
-                    .basic_publish(
-                        "",
-                        &queue,
-                        BasicPublishOptions { mandatory: true, ..Default::default() },
-                        &data,
-                        en.properties.clone(),
-                    )
-                    .await
-                    .map_err(e)?
-                    .await
-                    .map_err(e)?;
-                if !matches!(conf, Confirmation::Ack(None)) {
-                    err = Some(format!("el broker rechazó el mensaje {}/{}", b.id, en.n));
-                    break;
+            let run = blocking(move || backup::read(&backup::path(&d2, &id2))).await?;
+            let mut w = sync_io(|| backup::Writer::open(&dir, &id))?;
+            let chosen: Vec<&backup::Entry> =
+                run.entries.iter().filter(|en| ns.contains(&en.n)).collect();
+            for group in chosen.chunks(500) {
+                let datas: Vec<Vec<u8>> = group
+                    .iter()
+                    .map(|en| B64.decode(&en.payload_b64).map_err(e))
+                    .collect::<R<_>>()?;
+                let msgs = group
+                    .iter()
+                    .zip(&datas)
+                    .map(|(en, d)| (&d[..], en.properties.clone()))
+                    .collect();
+                let errs = publish_all(&ch, &queue, msgs).await;
+                let first_err = errs.iter().flatten().next().cloned();
+                let upd: Vec<_> = group
+                    .iter()
+                    .zip(&errs)
+                    .filter(|(_, err)| err.is_none())
+                    .map(|(en, _)| (en.n, "republished", None))
+                    .collect();
+                done += upd.len() as u32;
+                sync_io(|| w.status(upd, Some(&queue)))?;
+                progress(&app, "republish", done, total);
+                if let Some(err) = first_err {
+                    return Err(err);
                 }
-                en.status = "republished".into();
-                en.error = None;
-                done += 1;
-            }
-            b.target = Some(queue.clone());
-            let d2 = dir.clone();
-            blocking(move || save_batch(&d2, &b)).await?;
-            progress(&app, "republish", done, total);
-            if let Some(err) = err {
-                return Err(err);
             }
         }
         Ok(())
@@ -811,27 +1079,25 @@ async fn republish(
     result.map(|_| done)
 }
 
+/// Borra entradas de respaldos; si un respaldo queda vacío se borra el archivo.
 #[tauri::command]
 async fn delete_local(app: AppHandle, items: Vec<EntryRef>) -> R<u32> {
     let dir = backup_dir(&app)?;
     blocking(move || {
-        let mut by_batch: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
-        for it in items {
-            by_batch.entry(it.batch).or_default().push(it.n);
-        }
         let mut removed = 0u32;
-        for (id, ns) in by_batch {
-            let mut b = load_batch(&dir, &id)?;
-            let before = b.entries.len();
-            b.entries.retain(|en| !ns.contains(&en.n));
-            removed += (before - b.entries.len()) as u32;
-            if b.entries.is_empty() {
-                std::fs::remove_file(batch_path(&dir, &id)).map_err(e)?;
+        for (id, ns) in group_refs(items) {
+            let file = backup::path(&dir, &id);
+            let run = backup::read(&file)?;
+            let ns: Vec<u32> =
+                ns.into_iter().filter(|n| run.entries.iter().any(|en| en.n == *n)).collect();
+            removed += ns.len() as u32;
+            if ns.len() == run.entries.len() {
+                std::fs::remove_file(&file).map_err(e)?;
             } else {
-                save_batch(&dir, &b)?;
+                backup::Writer::open(&dir, &id)?.deleted(&ns)?;
             }
         }
-        log::info!("delete_local: {removed} respaldos borrados");
+        log::info!("delete_local: {removed} entradas borradas");
         Ok(removed)
     })
     .await
@@ -954,7 +1220,10 @@ fn main() {
             peek,
             drain,
             cancel,
-            list_local,
+            list_backups,
+            load_backup,
+            move_selected,
+            publish_messages,
             republish,
             delete_local,
             backup_path,
