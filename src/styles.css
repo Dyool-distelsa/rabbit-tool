@@ -111,9 +111,9 @@
 /* Con las animaciones de Windows apagadas, WebView2 reporta reduced-motion. Se
    respeta en toda la UI menos en los conejos: son el indicador de "trabajando". */
 @media (prefers-reduced-motion: reduce) {
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash),
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash)::before,
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash)::after {
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *),
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *)::before,
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *)::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     animation-delay: 0s !important;
@@ -1070,3 +1070,187 @@ input[type='checkbox']:not(.switch):checked::after {
   .detail { display: none; }
   .splitter { display: none; }
 }
+
+/* --- paginador de mensajes y "toda la cola" --- */
+.msg-pager { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--color-text-dim); font-size: var(--text-sm); white-space: nowrap; }
+.msg-pager .icon-btn { font-size: 18px; }
+.msg-pager .icon-btn:disabled { opacity: 0.35; pointer-events: none; }
+.sel-all-queue { color: var(--color-accent-text); border-color: color-mix(in srgb, var(--color-accent) 45%, transparent); white-space: nowrap; }
+#pageSize { width: 112px; }
+#count { width: 96px; }
+
+/* --- confirmación según ambiente de la cola --- */
+.env-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  margin: calc(var(--space-6) * -1) calc(var(--space-6) * -1) 0;
+  padding: var(--space-4) var(--space-6);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: color-mix(in srgb, var(--env) 16%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--env) 45%, transparent);
+  color: var(--env);
+}
+.env-banner b { display: block; letter-spacing: 0.06em; text-transform: uppercase; font-size: var(--text-sm); }
+.env-banner > div > span { display: block; color: var(--color-text); font-size: var(--text-sm); }
+.env-banner__icon { font-size: 22px; line-height: 1; }
+.modal--prod { --env: var(--color-error); }
+.modal--qa { --env: #f08a24; }
+.modal--dev { --env: #3fa2f0; }
+.modal--prod .modal__card, .modal--qa .modal__card, .modal--dev .modal__card { border-color: color-mix(in srgb, var(--env) 60%, transparent); }
+.modal--prod .modal__card { box-shadow: var(--shadow-elevated), 0 0 0 3px color-mix(in srgb, var(--env) 25%, transparent); animation: modal-in var(--motion-duration-base) var(--motion-ease-decelerate), env-pulse 1.6s ease-in-out 0.2s 2; }
+@keyframes env-pulse { 50% { box-shadow: var(--shadow-elevated), 0 0 0 6px color-mix(in srgb, var(--env) 35%, transparent); } }
+.modal--prod #confirmOk { background: var(--color-error); border-color: transparent; color: #fff; }
+.modal--prod #confirmOk:disabled { opacity: 0.4; }
+.modal--qa #confirmOk { background: #f08a24; border-color: transparent; color: #fff; }
+.modal--dev #confirmOk { background: #3fa2f0; border-color: transparent; color: #fff; }
+.confirm-type code { font-family: var(--font-mono); color: var(--color-text); background: var(--color-bg-active); padding: 1px 6px; border-radius: var(--radius-sm); }
+.confirm-type input { font-family: var(--font-mono); }
+.confirm-type input.ok { border-color: var(--color-success); }
+
+/* --- prueba de conexión en el modal de perfil --- */
+.conn-test {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  background: var(--color-bg-active);
+  word-break: break-word;
+}
+.conn-test--ok { background: color-mix(in srgb, var(--color-success) 14%, transparent); color: var(--color-success); }
+.conn-test--warn { background: color-mix(in srgb, var(--color-warning) 14%, transparent); color: var(--color-warning); }
+.conn-test--bad { background: color-mix(in srgb, var(--color-error) 14%, transparent); color: var(--color-error); }
+.conn-test .bunny { --bunny-size: 26px; }
+
+/* --- conejo rezando (aviso de PROD/QA) --- */
+.pray { display: inline-flex; align-items: flex-end; gap: 2px; position: relative; }
+.pray__candle { width: calc(var(--pray-size) * 0.38); height: calc(var(--pray-size) * 0.76); overflow: visible; }
+.pray__wax { fill: #f3ead7; }
+.pray__drip { fill: #e6dac0; }
+.pray__holder { fill: #b9862f; }
+.pray__wick { fill: #3a2616; }
+.pray__flame { fill: #ffb43a; transform-box: fill-box; transform-origin: 50% 90%; animation: flame 0.9s ease-in-out infinite alternate; }
+.pray__flame-core { fill: #fff3b0; transform-box: fill-box; transform-origin: 50% 90%; animation: flame 0.7s ease-in-out infinite alternate-reverse; }
+.pray__glow { fill: #ffcf5a; opacity: 0.22; transform-box: fill-box; transform-origin: center; animation: glow 1.8s ease-in-out infinite alternate; }
+@keyframes flame {
+  0% { transform: scale(1, 1) skewX(0deg); }
+  35% { transform: scale(0.92, 1.08) skewX(-4deg); }
+  70% { transform: scale(1.05, 0.94) skewX(3deg); }
+  100% { transform: scale(0.97, 1.04) skewX(-2deg); }
+}
+@keyframes glow { from { opacity: 0.12; transform: scale(0.9); } to { opacity: 0.32; transform: scale(1.15); } }
+.pray__bunny { position: relative; display: inline-block; }
+/* El crucifijo va sostenido delante del pecho, entre las patas. */
+.pray__cross {
+  position: absolute;
+  left: calc(var(--pray-size) * 0.04);
+  top: calc(var(--pray-size) * 0.42);
+  width: calc(var(--pray-size) * 0.26);
+  height: calc(var(--pray-size) * 0.4);
+  fill: #e0b04a;
+  stroke: #9a6b1c;
+  stroke-width: 0.8;
+  filter: drop-shadow(0 0 3px rgba(255, 207, 90, 0.55));
+  transform-origin: 50% 100%;
+  animation: cross-sway 2.4s ease-in-out infinite alternate;
+}
+@keyframes cross-sway { from { transform: rotate(-4deg); } to { transform: rotate(4deg); } }
+/* El conejo mira la veladora (a su izquierda) y baja las orejas, devoto. */
+.pray .bunny--sit .b-ear-f, .pray .bunny--sit .b-ear-b { animation: none; transform: rotate(14deg); }
+.env-banner__icon .pray { margin: -6px 0 -4px; }
+/* Halo de luz detrás del conejo que reza: santo, y además se lee sobre el rojo. */
+.pray__bunny::before {
+  content: '';
+  position: absolute;
+  inset: -10% -14% 0 -14%;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, rgba(255, 246, 214, 0.85), rgba(255, 236, 170, 0.35) 60%, transparent);
+  animation: glow 2.4s ease-in-out infinite alternate;
+}
+.pray__bunny .bunny { position: relative; }
+.pray__bunny .pray__cross { z-index: 1; }
+
+.actionbar { flex-wrap: wrap; row-gap: var(--space-2); }
+.qtitle { min-width: 140px; flex-shrink: 1; }
+
+/* --- escena de terror del aviso (crece con la cantidad de mensajes) --- */
+/* 240×130 a 324 px: el conejo mide 108 px. */
+.stage { display: block; width: 324px; height: 175px; flex-shrink: 0; border-radius: var(--radius-md); overflow: hidden; }
+.stage.lvl-0 { overflow: visible; }
+.stage .bunny { color: var(--bunny); }
+.stage .t-arm, .stage .t-arm ellipse { fill: var(--bunny); }
+.stage .t-cross { fill: #e0b04a; stroke: #8a5d16; stroke-width: 0.7; filter: drop-shadow(0 0 2.5px rgba(255, 207, 90, 0.7)); }
+.stage .t-halo { transform-box: fill-box; transform-origin: center; animation: glow 2.4s ease-in-out infinite alternate; }
+.stage .t-sky { transition: none; }
+.stage .t-star { fill: #fff; animation: twinkle 2.6s ease-in-out infinite alternate; }
+@keyframes twinkle { from { opacity: 0.2; } to { opacity: 1; } }
+.stage .t-moon circle { fill: #efe9cf; }
+.stage .t-moon .t-crater { fill: #d6cfb1; }
+.stage .t-moon { filter: drop-shadow(0 0 6px rgba(239, 233, 207, 0.6)); }
+.stage .t-moon--blood circle { fill: #c8553d; }
+.stage .t-moon--blood .t-crater { fill: #9c3a27; }
+.stage .t-moon--blood { filter: drop-shadow(0 0 8px rgba(200, 85, 61, 0.8)); }
+.stage .t-ground { fill: #0b0c16; }
+.stage .t-clouds { fill: #2a2c45; opacity: 0.9; animation: t-clouds 16s ease-in-out infinite alternate; }
+@keyframes t-clouds { to { transform: translateX(-28px); } }
+
+/* Relámpago: destello en el cielo + rayo, cada --period. */
+.stage .t-bolt { fill: #fdf6c8; filter: drop-shadow(0 0 4px #fff); opacity: 0; animation: t-bolt var(--period) linear infinite; }
+.stage .t-flash { fill: #c9d4ff; opacity: 0; animation: t-flash var(--period) linear infinite; }
+@keyframes t-bolt { 0%, 87%, 100% { opacity: 0; } 88% { opacity: 1; } 89.5% { opacity: 0.15; } 91% { opacity: 1; } 93% { opacity: 0; } }
+@keyframes t-flash { 0%, 87%, 100% { opacity: 0; } 88% { opacity: 0.55; } 89.5% { opacity: 0.05; } 91% { opacity: 0.4; } 94% { opacity: 0; } }
+
+/* Demonio: nivel 3 tenue y se enciende con el relámpago; desde 4 queda a la vista. */
+.stage .t-demon { opacity: 0; animation: t-demon var(--period) linear infinite; }
+.stage .t-eyes { fill: #ff4a3a; filter: drop-shadow(0 0 2px #fff0a0) drop-shadow(0 0 6px #ff0000) drop-shadow(0 0 12px #ff2000); }
+@keyframes t-demon { 0%, 86%, 100% { opacity: 0.4; } 88%, 93% { opacity: 1; } }
+.stage.lvl-4 .t-demon, .stage.lvl-5 .t-demon { animation-name: t-demon-near; }
+@keyframes t-demon-near { 0%, 87%, 100% { opacity: 0.85; } 88%, 93% { opacity: 1; } }
+.stage.lvl-4 .t-eyes, .stage.lvl-5 .t-eyes { animation: t-eyes 1.4s ease-in-out infinite alternate; }
+@keyframes t-eyes { from { opacity: 0.5; } to { opacity: 1; } }
+.stage.lvl-5 .t-demon { transform-box: view-box; transform-origin: 202px 130px; transform: scale(1.14) translateX(-10px); }
+
+/* Lluvia. */
+.stage .t-rain path { stroke: rgba(170, 190, 255, 0.45); stroke-width: 0.8; animation: t-rain 0.6s linear infinite; }
+@keyframes t-rain { from { transform: translate(0, -20px); } to { transform: translate(-10px, 135px); } }
+
+/* Biblia. */
+.stage .t-bible__cover { fill: #5a1f17; }
+.stage .t-bible__page { fill: #f4ecd8; }
+.stage .t-bible__page--r { fill: #e6dbc1; }
+.stage .t-bible__flip { fill: #fbf6e9; transform-box: view-box; transform-origin: 86px 113px; animation: t-flip 2.2s ease-in-out infinite; }
+@keyframes t-flip { 0%, 30% { transform: scaleX(1); } 60%, 100% { transform: scaleX(-1); } }
+.stage .t-bible__mark { stroke: #b9862f; stroke-width: 0.9; fill: none; }
+.stage .t-bible__ribbon { stroke: #a3241a; stroke-width: 1.2; }
+
+/* Miedo: tiembla desde 4; con 5 la llama se vuelve loca y todo se tiñe de rojo. */
+.stage.lvl-4 .t-holder, .stage.lvl-5 .t-holder { animation: t-tremble 0.11s linear infinite alternate; }
+@keyframes t-tremble { from { transform: translate(-0.5px, 0); } to { transform: translate(0.6px, 0.3px); } }
+.stage.lvl-4 .t-world, .stage.lvl-5 .t-world { animation: t-shake var(--period) linear infinite; }
+@keyframes t-shake { 0%, 87%, 95%, 100% { transform: translate(0, 0); } 88% { transform: translate(-3px, 1px); } 89.5% { transform: translate(3px, -1px); } 91% { transform: translate(-2px, 0); } 93% { transform: translate(1px, 1px); } }
+.stage.lvl-5 .pray__flame { animation-duration: 0.18s; }
+.stage.lvl-5 .pray__flame-core { animation-duration: 0.14s; }
+.stage .t-blood { fill: #6b0000; mix-blend-mode: multiply; animation: t-blood 2.8s ease-in-out infinite alternate; }
+@keyframes t-blood { from { opacity: 0.15; } to { opacity: 0.45; } }
+
+/* Con la escena el aviso se agranda. */
+.modal--prod .modal__card, .modal--qa .modal__card, .modal--dev .modal__card { width: 700px; }
+.env-banner { align-items: center; }
+.env-banner__icon .stage { margin: -6px 0; }
+.env-banner #envFear { display: block; margin-top: var(--space-2); font-style: italic; color: var(--env); font-size: var(--text-sm); }
+/* Desde 4 el demonio tiene un contorno rojo tenue: se distingue de la noche. */
+
+/* Demonio intenso: cuerpo rojo-negro, contorno rojo brillante y aura que late. */
+.stage .t-demon__body { stroke: #ff3b2b; stroke-width: 1.3; stroke-linejoin: round; filter: drop-shadow(0 0 4px rgba(255, 40, 30, 0.9)) drop-shadow(0 0 12px rgba(200, 0, 0, 0.7)); }
+.stage .t-aura { transform-box: fill-box; transform-origin: center; animation: t-aura 1.8s ease-in-out infinite alternate; }
+@keyframes t-aura { from { opacity: 0.55; transform: scale(0.94); } to { opacity: 1; transform: scale(1.06); } }
+.stage.lvl-5 .t-aura { animation-duration: 0.9s; }
+.stage.lvl-5 .t-demon__body { stroke-width: 1.8; }
+
+/* --- estados del respaldo y casilla del diálogo --- */
+.tag--published { background: color-mix(in srgb, #f08a24 18%, transparent); color: #f08a24; }
+.modal label.confirm-check { flex-direction: row; align-items: center; gap: var(--space-3); font-size: var(--text-sm); color: var(--color-text); cursor: pointer; }
+#retention { width: 150px; }

@@ -89,10 +89,18 @@
             <span class="pill pill--dim" id="curUnacked" title="unacked"></span>
           </div>
           <div class="toolbar__spacer"></div>
-          <label class="field" title="Cantidad de mensajes por operación">
-            N <input id="count" type="number" value="100" min="1" max="20000" />
+          <select id="pageSize" title="Mensajes por página al ver">
+            <option value="100">100 / pág.</option>
+            <option value="500">500 / pág.</option>
+            <option value="1000">1.000 / pág.</option>
+            <option value="5000">5.000 / pág.</option>
+          </select>
+          <button class="btn" id="peek" title="Lee la primera página y la devuelve a la cola (Ctrl+R)">Ver (nack)</button>
+          <span class="divider"></span>
+          <label class="field" title="Cantidad a ackear o mover (sin selección). Sin tope: “Todos” usa todos los ready.">
+            N <input id="count" type="number" value="100" min="1" />
           </label>
-          <button class="btn" id="peek" title="Lee N mensajes y los devuelve a la cola (Ctrl+R)">Ver (nack)</button>
+          <button class="btn btn--sm btn--ghost" id="countAll" title="Poner N = todos los mensajes ready de la cola">Todos</button>
           <button class="btn btn--danger" id="ack" title="Saca N mensajes (o los seleccionados) de la cola, respaldándolos localmente">Ack N</button>
           <span class="divider"></span>
           <input id="target" list="queueNames" placeholder="Cola destino…" spellcheck="false" />
@@ -111,12 +119,20 @@
 
         <div class="actionbar" id="localActions" hidden>
           <select id="bkpSelect" title="Cada movimiento o ack guarda su propio respaldo; por defecto se muestra el último"></select>
+          <button class="btn btn--sm btn--danger btn--ghost" id="deleteRun" title="Borrar este respaldo completo">Borrar envío</button>
+          <select id="retention" title="Retención: borra respaldos más viejos (nunca el último ni los que tienen pending/published)">
+            <option value="7">Guardar 7 días</option>
+            <option value="30">Guardar 30 días</option>
+            <option value="90">Guardar 90 días</option>
+            <option value="0">Guardar siempre</option>
+          </select>
           <div class="toolbar__spacer"></div>
           <select id="statusFilter" title="Filtrar por estado">
             <option value="">Todos los estados</option>
             <option value="done">done</option>
             <option value="error">error</option>
-            <option value="pending">pending</option>
+            <option value="pending">pending (sigue en origen)</option>
+            <option value="published">published (posible duplicado)</option>
             <option value="republished">republished</option>
           </select>
           <button class="btn" id="republishSel">Re-publicar…</button>
@@ -131,7 +147,13 @@
             <button class="icon-btn icon-btn--sm" id="clearFilter" title="Limpiar (Esc)" hidden>✕</button>
           </div>
           <span class="sel-pill" id="selCount" hidden></span>
+          <button class="btn btn--sm sel-all-queue" id="selQueue" hidden></button>
           <span class="dim" id="shown"></span>
+          <div class="msg-pager" id="msgPager" hidden>
+            <button class="icon-btn" id="msgPrev" title="Página anterior">‹</button>
+            <span class="mono" id="msgPageInfo"></span>
+            <button class="icon-btn" id="msgNext" title="Página siguiente (recorre los anteriores para llegar)">›</button>
+          </div>
         </div>
 
         <div class="opbar" id="opbar" hidden>
@@ -205,20 +227,31 @@
         <label>Contraseña<input name="pass" type="password" autocomplete="off" /></label>
       </div>
       <p class="hint">Se guarda en este equipo (incluida la contraseña, sin cifrar).</p>
+      <div class="conn-test" id="connTest" hidden></div>
       <div class="modal__actions">
         <button type="button" class="btn btn--danger btn--ghost" id="connDelete">Borrar perfil</button>
         <div class="toolbar__spacer"></div>
         <button value="cancel" class="btn" formnovalidate>Cancelar</button>
-        <button value="save" class="btn btn--primary">Guardar y conectar</button>
+        <button type="button" class="btn" id="connTestBtn" title="Prueba management y AMQP con estos datos, sin guardar">Probar conexión</button>
+        <button value="save" class="btn btn--primary" id="connSave">Guardar</button>
       </div>
     </form>
   </dialog>
 
   <dialog class="modal" id="confirmDialog">
     <form method="dialog" class="modal__card modal__card--sm">
+      <div class="env-banner" id="envBanner" hidden>
+        <span class="env-banner__icon" id="envIcon"></span>
+        <div><b id="envTitle"></b><span id="envText"></span></div>
+      </div>
       <h2 id="confirmTitle"></h2>
       <p id="confirmBody"></p>
       <label id="confirmQueueWrap" hidden>Cola destino<input id="confirmQueue" list="queueNames" spellcheck="false" /></label>
+      <label class="check confirm-check" id="confirmCheckWrap" hidden><input type="checkbox" id="confirmCheck" /> <span id="confirmCheckLabel"></span></label>
+      <label id="confirmTypeWrap" class="confirm-type" hidden>
+        <span>Para confirmar, escribí el nombre de la cola: <code id="confirmTypeName"></code></span>
+        <input id="confirmType" spellcheck="false" autocomplete="off" />
+      </label>
       <div class="modal__actions">
         <div class="toolbar__spacer"></div>
         <button value="cancel" class="btn">Cancelar</button>

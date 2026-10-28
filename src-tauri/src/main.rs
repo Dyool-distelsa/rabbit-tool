@@ -29,8 +29,11 @@ type R<T> = Result<T, String>;
 /// (`error sending request` solo no dice nada; la causa sí), y lo deja en el log
 /// con el detalle completo (`Debug`).
 #[track_caller]
-fn e<E: std::error::Error>(err: E) -> String {
-    let mut msg = err.to_string();
+fn e<E: std::error::Error + 'static>(err: E) -> String {
+    let mut msg = match (&err as &dyn std::any::Any).downcast_ref::<lapin::Error>() {
+        Some(le) => amqp_msg(le),
+        None => err.to_string(),
+    };
     let mut src = err.source();
     while let Some(s) = src {
         let part = s.to_string();
@@ -45,10 +48,53 @@ fn e<E: std::error::Error>(err: E) -> String {
     msg
 }
 
+/// Texto entendible para los errores de AMQP más comunes (el de lapin es críptico:
+/// "protocol error: ACCESS_REFUSED - ..."). Se conserva el detalle del broker.
+fn amqp_msg(err: &lapin::Error) -> String {
+    use lapin::protocol::{AMQPErrorKind, AMQPHardError, AMQPSoftError};
+    match err {
+        lapin::Error::ProtocolError(pe) => {
+            let detail = pe.get_message().as_str();
+            let hint = match pe.kind() {
+                AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED) => {
+                    "sin permiso AMQP (configure/write/read) sobre ese recurso o vhost"
+                }
+                AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND) => "la cola o el exchange no existe",
+                AMQPErrorKind::Soft(AMQPSoftError::RESOURCELOCKED) => {
+                    "la cola es exclusiva de otra conexión (o tiene un consumidor exclusivo)"
+                }
+                AMQPErrorKind::Soft(AMQPSoftError::PRECONDITIONFAILED) => {
+                    "el broker rechazó la operación (p. ej. se superó su consumer_timeout o un tag de entrega no es válido)"
+                }
+                AMQPErrorKind::Hard(AMQPHardError::NOTALLOWED) => "el broker no permite la operación (¿vhost sin acceso?)",
+                AMQPErrorKind::Hard(AMQPHardError::CONNECTIONFORCED) => "el broker cerró la conexión",
+                AMQPErrorKind::Hard(AMQPHardError::RESOURCEERROR) => "el broker se quedó sin recursos",
+                _ => "error de protocolo AMQP",
+            };
+            format!("{hint}: {detail}")
+        }
+        lapin::Error::IOError(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionRefused => format!("conexión AMQP rechazada (¿host/puerto correctos?): {io}"),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                format!("se cortó la conexión AMQP: {io}")
+            }
+            std::io::ErrorKind::TimedOut => format!("timeout de red AMQP: {io}"),
+            _ => format!("error de red AMQP: {io}"),
+        },
+        lapin::Error::InvalidChannelState(st) => {
+            format!("el canal AMQP ya está cerrado ({st:?}); el broker lo cerró por un error anterior, revisá el log")
+        }
+        lapin::Error::InvalidConnectionState(st) => format!("la conexión AMQP no está activa ({st:?})"),
+        other => other.to_string(),
+    }
+}
+
 /// Mensajes por lote: un fsync del respaldo y un ack múltiple por lote.
 const CHUNK: usize = 250;
-/// Si la cola deja de entregar por este tiempo, se asume vacía.
-const IDLE: Duration = Duration::from_millis(1500);
+/// Si la cola deja de entregar por este tiempo se asume que se vació (o que otro
+/// consumidor se llevó el resto). Holgado para brokers lentos o mensajes grandes;
+/// cuando corta antes de lo esperado se informa como "detenido".
+const IDLE: Duration = Duration::from_secs(5);
 /// Tope de lectura por operación (prefetch es u16 y la UI tiene que poder con ello).
 const MAX_PEEK: u32 = 20_000;
 
@@ -436,6 +482,80 @@ async fn next(consumer: &mut lapin::Consumer) -> R<Option<Delivery>> {
     }
 }
 
+/// Mensajes por consumer al leer sin ack. lapin bufferiza sin límite lo que el
+/// broker manda hasta el prefetch: con 2 000 la memoria queda acotada a ~2 000
+/// mensajes aunque se recorran 200k (65 000 × 50 KB eran ~3 GB).
+const WINDOW: u32 = 2_000;
+
+/// Lee hasta `n` mensajes en orden y sin ack, sin el techo de 65 535 del prefetch:
+/// encadena consumers en el mismo canal y crea el siguiente recién cuando el
+/// anterior llenó su prefetch, así el broker entrega en el orden de la cola. Solo
+/// sirve cuando no se ackea durante la lectura (ackear liberaría al consumer
+/// anterior y mezclaría las entregas).
+struct Reader<'a> {
+    ch: &'a Channel,
+    queue: &'a str,
+    cur: Option<lapin::Consumer>,
+    in_cur: u32,
+    cur_cap: u32,
+    left: u32,
+}
+
+impl<'a> Reader<'a> {
+    fn new(ch: &'a Channel, queue: &'a str, n: u32) -> Self {
+        Reader { ch, queue, cur: None, in_cur: 0, cur_cap: 0, left: n }
+    }
+
+    async fn next(&mut self) -> R<Option<Delivery>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        if self.cur.is_none() || self.in_cur >= self.cur_cap {
+            self.cur_cap = self.left.min(WINDOW);
+            // basic.qos aplica a los consumers creados después.
+            self.ch
+                .basic_qos(self.cur_cap as u16, BasicQosOptions::default())
+                .await
+                .map_err(e)?;
+            let c = self
+                .ch
+                .basic_consume(self.queue, "", BasicConsumeOptions::default(), FieldTable::default())
+                .await
+                .map_err(e)?;
+            self.cur = Some(c);
+            self.in_cur = 0;
+        }
+        match next(self.cur.as_mut().unwrap()).await? {
+            Some(d) => {
+                self.in_cur += 1;
+                self.left -= 1;
+                Ok(Some(d))
+            }
+            None => {
+                self.left = 0;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Arranca una operación cancelable: descarta un pedido de cancelación viejo.
+fn begin(state: &AppState) {
+    state.cancel.store(false, Ordering::SeqCst);
+}
+
+fn cancelled(state: &AppState) -> bool {
+    state.cancel.load(Ordering::SeqCst)
+}
+
+/// Origen y destino iguales: publicaría lo mismo que está consumiendo.
+fn same_queue(source: &str, target: &Option<String>) -> R<()> {
+    match target {
+        Some(t) if t == source => Err("el destino no puede ser la misma cola que el origen".into()),
+        _ => Ok(()),
+    }
+}
+
 fn progress(app: &AppHandle, op: &str, done: u32, total: u32) {
     let _ = app.emit("progress", json!({ "op": op, "done": done, "total": total }));
 }
@@ -543,42 +663,47 @@ async fn list_queues(conn: Conn, q: QueuePage) -> R<Value> {
     }))
 }
 
-/// Lee hasta `count` mensajes y los devuelve a la cola con nack+requeue.
-/// Va por AMQP con prefetch: mucho más rápido que el GET de management.
+/// Lee una página de mensajes (`limit` a partir de la posición `offset`) y los
+/// devuelve todos a la cola con nack+requeue. Para llegar a `offset` hay que
+/// recorrer los anteriores (AMQP no permite saltar): se leen sin guardarlos.
 #[tauri::command]
 async fn peek(
     app: AppHandle,
     state: State<'_, AppState>,
     conn: Conn,
     queue: String,
-    count: u32,
-) -> R<Vec<Value>> {
-    log::info!("peek \"{queue}\" count={count} {}", conn.desc());
+    offset: u32,
+    limit: u32,
+) -> R<Value> {
+    log::info!("peek \"{queue}\" offset={offset} limit={limit} {}", conn.desc());
+    begin(&state);
     let t = std::time::Instant::now();
-    let total = ready_count(&conn, &state, &queue).await?.min(count).min(MAX_PEEK);
-    if total == 0 {
-        log::info!("peek \"{queue}\": cola vacía");
-        return Ok(vec![]);
+    let ready = ready_count(&conn, &state, &queue).await?;
+    let limit = limit.min(MAX_PEEK);
+    let total = ready.min(offset.saturating_add(limit));
+    if total <= offset {
+        log::info!("peek \"{queue}\": nada desde {offset} (ready={ready})");
+        return Ok(json!({ "items": [], "offset": offset, "ready": ready, "stalled": false, "cancelled": false }));
     }
     progress(&app, "peek", 0, total);
     let ch = channel(&state, &conn).await?;
-    ch.basic_qos(total.min(u16::MAX as u32) as u16, BasicQosOptions::default())
-        .await
-        .map_err(e)?;
-    let mut consumer = ch
-        .basic_consume(&queue, "", BasicConsumeOptions::default(), FieldTable::default())
-        .await
-        .map_err(e)?;
+    let mut reader = Reader::new(&ch, &queue, total);
 
-    let mut out = Vec::with_capacity(total as usize);
-    let mut last_tag = 0;
+    let mut out = Vec::with_capacity((total - offset) as usize);
+    let (mut last_tag, mut seen, mut stopped) = (0, 0u32, false);
     let result = async {
-        while (out.len() as u32) < total {
-            let Some(d) = next(&mut consumer).await? else { break };
+        while let Some(d) = reader.next().await? {
             last_tag = d.delivery_tag;
-            out.push(delivery_json(&d));
-            if out.len() % 100 == 0 {
-                progress(&app, "peek", out.len() as u32, total);
+            if cancelled(&state) {
+                stopped = true;
+                break;
+            }
+            if seen >= offset {
+                out.push(delivery_json(&d));
+            }
+            seen += 1;
+            if seen % 500 == 0 {
+                progress(&app, "peek", seen, total);
             }
         }
         Ok::<_, String>(())
@@ -595,8 +720,14 @@ async fn peek(
     }
     let _ = ch.close(200, "ok").await;
     result?;
-    log::info!("peek \"{queue}\": {} de {total} mensajes en {:?}", out.len(), t.elapsed());
-    Ok(out)
+    // Se esperaba recorrer `total`: si no, la cola dejó de entregar (otro consumidor).
+    let stalled = !stopped && seen < total;
+    log::info!(
+        "peek \"{queue}\": {} mensajes desde {offset} (recorridos {seen}/{total}, ready {ready}, cancelado={stopped}, detenido={stalled}) en {:?}",
+        out.len(),
+        t.elapsed()
+    );
+    Ok(json!({ "items": out, "offset": offset, "ready": ready, "stalled": stalled, "cancelled": stopped }))
 }
 
 /// Publica en vuelo al default exchange → `queue` (mandatory) y después espera los
@@ -654,7 +785,17 @@ async fn process_group(
     let errs = match target {
         Some(t) => {
             let msgs = ds.iter().map(|d| (&d.data[..], d.properties.clone())).collect();
-            publish_all(ch, t, msgs).await
+            let errs = publish_all(ch, t, msgs).await;
+            // Antes del ack: si se corta acá, el respaldo dice "published" (posible
+            // duplicado) y no "pending" (que significaría "sigue solo en origen").
+            let published: Vec<_> = errs
+                .iter()
+                .enumerate()
+                .filter(|(_, err)| err.is_none())
+                .map(|(i, _)| (base + i as u32, "published", None))
+                .collect();
+            sync_io(|| w.status(published, None, true))?;
+            errs
         }
         None => vec![None; ds.len()],
     };
@@ -684,7 +825,10 @@ async fn process_group(
             Some(msg) => (base + i as u32, "error", Some(format!("{msg} (sigue en origen)"))),
         })
         .collect();
-    sync_io(|| w.status(upd, None))?;
+    // Al mover, "done" solo confirma un "published" ya durable: sin fsync. En un ack
+    // sin destino es el único registro de que salió de la cola: con fsync.
+    let sync = target.is_none();
+    sync_io(|| w.status(upd, None, sync))?;
     Ok(errs)
 }
 
@@ -700,9 +844,10 @@ async fn drain(
     target: Option<String>,
     count: u32,
 ) -> R<Value> {
-    state.cancel.store(false, Ordering::SeqCst);
+    begin(&state);
     let op = if target.is_some() { "move" } else { "ack" };
     log::info!("{op} \"{source}\" → {target:?} count={count} {}", conn.desc());
+    same_queue(&source, &target)?;
     let started = std::time::Instant::now();
 
     if let Some(t) = &target {
@@ -711,7 +856,7 @@ async fn drain(
     }
     let total = ready_count(&conn, &state, &source).await?.min(count);
     if total == 0 {
-        return Ok(json!({ "ok": 0, "total": 0, "failed": [], "cancelled": false, "backup": null }));
+        return Ok(json!({ "ok": 0, "total": 0, "failed": [], "cancelled": false, "stalled": false, "backup": null }));
     }
 
     let ch = channel(&state, &conn).await?;
@@ -765,10 +910,12 @@ async fn drain(
 
     // Lo prefetcheado y no procesado vuelve a la cola al cerrar el canal.
     let _ = ch.close(200, "ok").await;
+    let was_cancelled = cancelled(&state);
+    // Terminó sin llegar al total, sin cancelar ni fallar: la cola dejó de entregar.
+    let stalled = result.is_ok() && !was_cancelled && failed.is_empty() && ok < total;
     log::info!(
-        "{op} \"{source}\": {ok}/{total} ok, {} fallidos, cancelado={}, {:?}{}",
+        "{op} \"{source}\": {ok}/{total} ok, {} fallidos, cancelado={was_cancelled}, detenido={stalled}, {:?}{}",
         failed.len(),
-        state.cancel.load(Ordering::SeqCst),
         started.elapsed(),
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
     );
@@ -777,7 +924,8 @@ async fn drain(
         "ok": ok,
         "total": total,
         "failed": failed,
-        "cancelled": state.cancel.load(Ordering::SeqCst),
+        "cancelled": was_cancelled,
+        "stalled": stalled,
         "backup": run.map(|(_, id)| id),
     }))
 }
@@ -796,16 +944,18 @@ async fn move_selected(
     fps: Vec<String>,
     scan: u32,
 ) -> R<Value> {
+    begin(&state);
     let op = if target.is_some() { "move" } else { "ack" };
     let wanted = fps.len() as u32;
     log::info!(
         "{op} seleccionados \"{source}\" → {target:?}: {wanted} elegidos, scan={scan} {}",
         conn.desc()
     );
+    same_queue(&source, &target)?;
     if let Some(t) = &target {
         ready_count(&conn, &state, t).await?;
     }
-    let scan = ready_count(&conn, &state, &source).await?.min(scan).min(MAX_PEEK);
+    let scan = ready_count(&conn, &state, &source).await?.min(scan);
     if scan == 0 || wanted == 0 {
         return Ok(json!({ "ok": 0, "total": wanted, "not_found": wanted, "moved": [], "failed": [], "backup": null }));
     }
@@ -814,13 +964,7 @@ async fn move_selected(
     if target.is_some() {
         ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
     }
-    ch.basic_qos(scan.min(u16::MAX as u32) as u16, BasicQosOptions::default())
-        .await
-        .map_err(e)?;
-    let mut consumer = ch
-        .basic_consume(&source, "", BasicConsumeOptions::default(), FieldTable::default())
-        .await
-        .map_err(e)?;
+    let mut reader = Reader::new(&ch, &source, scan);
 
     let mut want: std::collections::HashMap<String, u32> = Default::default();
     for fp in fps {
@@ -833,13 +977,19 @@ async fn move_selected(
 
     let result: R<()> = async {
         let (mut picked, mut picked_fp) = (Vec::<Delivery>::new(), Vec::<String>::new());
-        // Lo recorrido y no elegido se retiene sin ack hasta cerrar el canal, así
-        // vuelve todo junto y en orden.
-        let mut held = Vec::new();
-        let mut seen = 0;
-        while seen < scan && left > 0 {
-            let Some(d) = next(&mut consumer).await? else { break };
+        // Lo recorrido y no elegido queda sin ack en el canal hasta cerrarlo, así
+        // vuelve todo junto y en orden. No se guarda el contenido (pueden ser 200k).
+        let mut seen = 0u32;
+        while left > 0 {
+            let Some(d) = reader.next().await? else { break };
+            // Cancelar durante el recorrido no toca nada: todo vuelve a la cola.
+            if cancelled(&state) {
+                return Ok(());
+            }
             seen += 1;
+            if seen % 1000 == 0 {
+                progress(&app, "scan", seen, scan);
+            }
             let f = fingerprint(&d);
             match want.get_mut(&f) {
                 Some(c) if *c > 0 => {
@@ -848,7 +998,7 @@ async fn move_selected(
                     picked.push(d);
                     picked_fp.push(f);
                 }
-                _ => held.push(d),
+                _ => {}
             }
         }
         log::info!(
@@ -861,6 +1011,10 @@ async fn move_selected(
         let (mut w, id) = new_run(&app, op, &source, &target)?;
         backup_id = Some(id);
         for (i, group) in picked.chunks(CHUNK).enumerate() {
+            // Entre lotes: lo ya procesado queda hecho; el resto vuelve a la cola.
+            if cancelled(&state) {
+                break;
+            }
             let refs: Vec<&Delivery> = group.iter().collect();
             let base = i * CHUNK;
             let errs = process_group(&ch, &mut w, base as u32, &refs, &target, true).await?;
@@ -872,15 +1026,15 @@ async fn move_selected(
             }
             progress(&app, op, moved.len() as u32, wanted);
         }
-        drop(held);
         Ok(())
     }
     .await;
 
     // Cerrar el canal reencola todo lo que quedó sin ack (no elegidos y fallidos).
     let _ = ch.close(200, "ok").await;
+    let was_cancelled = cancelled(&state);
     log::info!(
-        "{op} seleccionados \"{source}\": {}/{wanted} ok, {} fallidos, {left} no encontrados{}",
+        "{op} seleccionados \"{source}\": {}/{wanted} ok, {} fallidos, {left} no encontrados, cancelado={was_cancelled}{}",
         moved.len(),
         failed.len(),
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
@@ -889,9 +1043,10 @@ async fn move_selected(
     Ok(json!({
         "ok": moved.len(),
         "total": wanted,
-        "not_found": left,
+        "not_found": if was_cancelled { 0 } else { left },
         "moved": moved,
         "failed": failed,
+        "cancelled": was_cancelled,
         "backup": backup_id,
     }))
 }
@@ -912,21 +1067,30 @@ async fn publish_messages(
     queue: String,
     messages: Vec<PubMsg>,
 ) -> R<Value> {
+    begin(&state);
     let total = messages.len() as u32;
     log::info!("publish_messages → \"{queue}\": {total} mensajes {}", conn.desc());
     ready_count(&conn, &state, &queue).await?;
     let ch = channel(&state, &conn).await?;
     ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
     let (mut ok, mut failed) = (0u32, Vec::<String>::new());
+    // Índices publicados con confirmación: la UI los marca para no re-enviarlos.
+    let mut published: Vec<u32> = Vec::new();
     progress(&app, "publish", 0, total);
-    for group in messages.chunks(500) {
+    for (gi, group) in messages.chunks(500).enumerate() {
+        if cancelled(&state) {
+            break;
+        }
         let msgs = group
             .iter()
             .map(|m| (m.payload.as_bytes(), props_from_json(&m.properties)))
             .collect();
-        for err in publish_all(&ch, &queue, msgs).await {
+        for (j, err) in publish_all(&ch, &queue, msgs).await.into_iter().enumerate() {
             match err {
-                None => ok += 1,
+                None => {
+                    ok += 1;
+                    published.push((gi * 500 + j) as u32);
+                }
                 Some(msg) => failed.push(msg),
             }
         }
@@ -936,8 +1100,12 @@ async fn publish_messages(
         }
     }
     let _ = ch.close(200, "ok").await;
-    log::info!("publish_messages → \"{queue}\": {ok}/{total} ok, {} fallidos", failed.len());
-    Ok(json!({ "ok": ok, "total": total, "failed": failed }))
+    let was_cancelled = cancelled(&state);
+    log::info!(
+        "publish_messages → \"{queue}\": {ok}/{total} ok, {} fallidos, cancelado={was_cancelled}",
+        failed.len()
+    );
+    Ok(json!({ "ok": ok, "total": total, "failed": failed, "published": published, "cancelled": was_cancelled }))
 }
 
 #[tauri::command]
@@ -945,24 +1113,26 @@ fn cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
 
-/// Respaldos disponibles (uno por ejecución), del más reciente al más viejo.
+fn meta_json(m: &backup::Meta) -> Value {
+    let h = &m.header;
+    json!({
+        "id": h.id, "ts": h.ts, "op": h.op, "source": h.source, "target": h.target,
+        "count": m.total(), "done": m.count("done"), "error": m.count("error"),
+        "pending": m.count("pending"), "published": m.count("published"),
+        "republished": m.count("republished"),
+    })
+}
+
+/// Respaldos disponibles (uno por ejecución), del más reciente al más viejo. Lee
+/// solo los resúmenes: no abre los .bkp.jsonl (pueden pesar cientos de MB).
 #[tauri::command]
 async fn list_backups(app: AppHandle) -> R<Vec<Value>> {
     let dir = backup_dir(&app)?;
     blocking(move || {
         let mut out = vec![];
         for id in backup::ids(&dir)?.into_iter().take(50) {
-            match backup::read(&backup::path(&dir, &id)) {
-                Ok(run) => {
-                    let count = |s: &str| run.entries.iter().filter(|en| en.status == s).count();
-                    out.push(json!({
-                        "id": id, "ts": run.header.ts, "op": run.header.op,
-                        "source": run.header.source, "target": run.header.target,
-                        "count": run.entries.len(), "done": count("done"),
-                        "error": count("error"), "pending": count("pending"),
-                        "republished": count("republished"),
-                    }));
-                }
+            match backup::read_meta(&dir, &id) {
+                Ok(m) => out.push(meta_json(&m)),
                 Err(err) => log::warn!("respaldo ilegible {id}: {err}"),
             }
         }
@@ -979,7 +1149,7 @@ async fn load_backup(app: AppHandle, id: Option<String>) -> R<Value> {
         let Some(id) = id.or_else(|| backup::ids(&dir).ok()?.into_iter().next()) else {
             return Ok(json!({ "id": null, "entries": [] }));
         };
-        let run = backup::read(&backup::path(&dir, &id))?;
+        let run = backup::read_run(&dir, &id)?;
         let h = &run.header;
         let entries: Vec<Value> = run
             .entries
@@ -991,6 +1161,7 @@ async fn load_backup(app: AppHandle, id: Option<String>) -> R<Value> {
                     "batch": id, "n": en.n, "ts": h.ts, "op": h.op,
                     "source": h.source,
                     "target": en.republished_to.clone().or_else(|| h.target.clone()),
+                    "republished_to": en.republished_to,
                     "status": en.status, "error": en.error,
                     "routing_key": en.routing_key, "exchange": en.exchange,
                     "size": raw.len(),
@@ -1010,12 +1181,13 @@ struct EntryRef {
     n: u32,
 }
 
-fn group_refs(items: Vec<EntryRef>) -> std::collections::BTreeMap<String, Vec<u32>> {
+fn group_refs(items: Vec<EntryRef>) -> R<std::collections::BTreeMap<String, Vec<u32>>> {
     let mut by_run: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
     for it in items {
+        backup::valid_id(&it.batch)?;
         by_run.entry(it.batch).or_default().push(it.n);
     }
-    by_run
+    Ok(by_run)
 }
 
 /// Re-publica entradas de un respaldo a una cola, con sus properties originales.
@@ -1026,23 +1198,28 @@ async fn republish(
     conn: Conn,
     items: Vec<EntryRef>,
     queue: String,
-) -> R<u32> {
+) -> R<Value> {
+    begin(&state);
     let dir = backup_dir(&app)?;
+    let by_run = group_refs(items)?;
     ready_count(&conn, &state, &queue).await?;
     let ch = channel(&state, &conn).await?;
     ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
 
-    let total = items.len() as u32;
+    let total = by_run.values().map(Vec::len).sum::<usize>() as u32;
     let mut done = 0u32;
     log::info!("republish → \"{queue}\": {total} entradas");
     let result: R<()> = async {
-        for (id, ns) in group_refs(items) {
+        for (id, ns) in by_run {
             let (d2, id2) = (dir.clone(), id.clone());
-            let run = blocking(move || backup::read(&backup::path(&d2, &id2))).await?;
-            let mut w = sync_io(|| backup::Writer::open(&dir, &id))?;
-            let chosen: Vec<&backup::Entry> =
-                run.entries.iter().filter(|en| ns.contains(&en.n)).collect();
+            let run = blocking(move || backup::read_run(&d2, &id2)).await?;
+            let mut w = sync_io(|| backup::Writer::open(&dir, &run))?;
+            let wanted: std::collections::HashSet<u32> = ns.into_iter().collect();
+            let chosen: Vec<&backup::Entry> = run.entries.iter().filter(|en| wanted.contains(&en.n)).collect();
             for group in chosen.chunks(500) {
+                if cancelled(&state) {
+                    return Ok(());
+                }
                 let datas: Vec<Vec<u8>> = group
                     .iter()
                     .map(|en| B64.decode(&en.payload_b64).map_err(e))
@@ -1061,7 +1238,7 @@ async fn republish(
                     .map(|(en, _)| (en.n, "republished", None))
                     .collect();
                 done += upd.len() as u32;
-                sync_io(|| w.status(upd, Some(&queue)))?;
+                sync_io(|| w.status(upd, Some(&queue), true))?;
                 progress(&app, "republish", done, total);
                 if let Some(err) = first_err {
                     return Err(err);
@@ -1072,33 +1249,78 @@ async fn republish(
     }
     .await;
     let _ = ch.close(200, "ok").await;
+    let was_cancelled = cancelled(&state);
     log::info!(
-        "republish → \"{queue}\": {done}/{total}{}",
+        "republish → \"{queue}\": {done}/{total}, cancelado={was_cancelled}{}",
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
     );
-    result.map(|_| done)
+    result?;
+    Ok(json!({ "ok": done, "total": total, "cancelled": was_cancelled }))
 }
 
-/// Borra entradas de respaldos; si un respaldo queda vacío se borra el archivo.
+/// Borra entradas de respaldos; si un respaldo queda vacío se borra completo.
 #[tauri::command]
 async fn delete_local(app: AppHandle, items: Vec<EntryRef>) -> R<u32> {
     let dir = backup_dir(&app)?;
+    let by_run = group_refs(items)?;
     blocking(move || {
         let mut removed = 0u32;
-        for (id, ns) in group_refs(items) {
-            let file = backup::path(&dir, &id);
-            let run = backup::read(&file)?;
+        for (id, ns) in by_run {
+            let run = backup::read_run(&dir, &id)?;
             let ns: Vec<u32> =
                 ns.into_iter().filter(|n| run.entries.iter().any(|en| en.n == *n)).collect();
             removed += ns.len() as u32;
             if ns.len() == run.entries.len() {
-                std::fs::remove_file(&file).map_err(e)?;
+                backup::remove(&dir, &id)?;
             } else {
-                backup::Writer::open(&dir, &id)?.deleted(&ns)?;
+                backup::Writer::open(&dir, &run)?.deleted(&ns)?;
             }
         }
         log::info!("delete_local: {removed} entradas borradas");
         Ok(removed)
+    })
+    .await
+}
+
+/// Borra un respaldo completo.
+#[tauri::command]
+async fn delete_backup(app: AppHandle, id: String) -> R<()> {
+    let dir = backup_dir(&app)?;
+    blocking(move || {
+        backup::remove(&dir, &id)?;
+        log::info!("respaldo {id} borrado completo");
+        Ok(())
+    })
+    .await
+}
+
+/// Retención: borra respaldos más viejos que `days` días. Nunca borra el último
+/// envío ni los que tienen entradas `pending`/`published` (su destino real no se
+/// conoce: podrían ser los únicos que quedan de esos mensajes).
+#[tauri::command]
+async fn prune_backups(app: AppHandle, days: u32) -> R<Value> {
+    let dir = backup_dir(&app)?;
+    blocking(move || {
+        let limit = now_ms().saturating_sub(days as u64 * 86_400_000);
+        let (mut removed, mut kept_unresolved) = (0u32, 0u32);
+        for (i, id) in backup::ids(&dir)?.into_iter().enumerate() {
+            let Ok(meta) = backup::read_meta(&dir, &id) else { continue };
+            if i == 0 || meta.header.ts >= limit {
+                continue;
+            }
+            if meta.unresolved() {
+                kept_unresolved += 1;
+                continue;
+            }
+            match backup::remove(&dir, &id) {
+                Ok(()) => removed += 1,
+                Err(err) => log::warn!("retención: no se pudo borrar {id}: {err}"),
+            }
+        }
+        if removed + kept_unresolved > 0 {
+            log::info!("retención {days} días: {removed} respaldos borrados, {kept_unresolved} conservados por tener entradas sin resolver");
+        }
+        Ok(json!({ "removed": removed, "kept_unresolved": kept_unresolved }))
     })
     .await
 }
@@ -1110,23 +1332,66 @@ async fn backup_path(app: AppHandle) -> R<String> {
 
 /// Mensajes ready exactos por AMQP (declare pasivo). Las estadísticas de
 /// management se refrescan cada ~5 s, así que justo después de mover van atrasadas.
+/// `errors` dice por cola por qué no se pudo leer (no existe, sin permiso…).
 #[tauri::command]
-async fn queues_ready(
-    state: State<'_, AppState>,
-    conn: Conn,
-    names: Vec<String>,
-) -> R<std::collections::HashMap<String, u32>> {
-    let mut out = std::collections::HashMap::new();
+async fn queues_ready(state: State<'_, AppState>, conn: Conn, names: Vec<String>) -> R<Value> {
+    let (mut ready, mut errors) = (Map::new(), Map::new());
     for name in names {
         match ready_count(&conn, &state, &name).await {
             Ok(n) => {
-                out.insert(name, n);
+                ready.insert(name, json!(n));
             }
-            // Una cola borrada no tiene que tirar abajo el resto.
-            Err(err) => log::warn!("queues_ready: {err}"),
+            // Una cola con problema no tiene que tirar abajo el resto.
+            Err(err) => {
+                log::warn!("queues_ready: {err}");
+                errors.insert(name, json!(err));
+            }
         }
     }
-    Ok(out)
+    Ok(json!({ "ready": ready, "errors": errors }))
+}
+
+// --- contraseñas en el almacén del sistema -----------------------------------------
+// Windows: Administrador de credenciales. Así no quedan en texto plano en el
+// localStorage del WebView.
+
+const KEYRING_SERVICE: &str = "com.dyool.rabbit-tool";
+
+fn keyring_entry(profile: &str) -> R<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, profile).map_err(e)
+}
+
+#[tauri::command]
+async fn secret_set(profile: String, pass: String) -> R<()> {
+    blocking(move || keyring_entry(&profile)?.set_password(&pass).map_err(e)).await
+}
+
+/// Contraseñas de varios perfiles; los que no tienen guardada no aparecen.
+#[tauri::command]
+async fn secret_get_all(profiles: Vec<String>) -> R<Map<String, Value>> {
+    blocking(move || {
+        let mut out = Map::new();
+        for p in profiles {
+            match keyring_entry(&p)?.get_password() {
+                Ok(pass) => {
+                    out.insert(p, json!(pass));
+                }
+                Err(keyring::Error::NoEntry) => {}
+                Err(err) => log::warn!("no se pudo leer la contraseña de \"{p}\": {err}"),
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn secret_delete(profile: String) -> R<()> {
+    blocking(move || match keyring_entry(&profile)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(e(err)),
+    })
+    .await
 }
 
 /// Cierra la conexión AMQP cacheada (al editar o cambiar de perfil).
@@ -1227,6 +1492,11 @@ fn main() {
             republish,
             delete_local,
             backup_path,
+            delete_backup,
+            prune_backups,
+            secret_set,
+            secret_get_all,
+            secret_delete,
             queues_ready,
             disconnect,
             log_ui,

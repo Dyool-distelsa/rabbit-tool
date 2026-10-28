@@ -1,13 +1,15 @@
 import { mountToastContainer } from './toast.js';
 import { createVirtualList } from './vlist.js';
 import { renderJson } from './highlight.js';
-import { mountBunnies, setBunnyMode, bunnyDash } from './bunny.js';
+import { mountBunnies, setBunnyMode, bunnyDash, bunny, terrorScene, terrorLevel, TERROR_TEXT } from './bunny.js';
+import { worstEnv, ENV_INFO } from './env.js';
 
 mountBunnies();
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
 // --- log: todo lo que falla en la UI va al mismo .log que el backend ----------------
 const log = (level, message) => invoke('log_ui', { level, message: String(message) }).catch(() => {});
@@ -42,7 +44,6 @@ const toast = {
 };
 
 const ROW_H = 54;
-const MAX_N = 20000;
 
 const S = {
   queues: [],
@@ -53,6 +54,9 @@ const S = {
   qpage: null, // { page, page_count, filtered_count, total_count } de la última carga
   currentInfo: null, // último dato conocido de la cola seleccionada
   qItems: [],
+  msgPage: null, // { offset, limit, ready } de la página de mensajes mostrada
+  qfp: new Map(), // posición en la cola → huella, de los seleccionados (de cualquier página)
+  allQueue: false, // "seleccionar toda la cola" (ack/mover todos los ready)
   localItems: [],
   view: [], // items filtrados que muestra la lista
   sel: -1, // índice en view del mensaje abierto en el detalle
@@ -114,6 +118,42 @@ if (!profiles) {
 }
 let profileName = store.get('profile', profiles[0]?.name);
 
+// Contraseñas: en el Administrador de credenciales del sistema, no en localStorage.
+// Acá solo vive la copia en memoria de esta sesión.
+const secrets = {};
+
+/** Guarda la contraseña de un perfil en el almacén del sistema (y en memoria). */
+async function saveSecret(name, pass) {
+  secrets[name] = pass;
+  try {
+    await call('secret_set', { profile: name, pass }, { quiet: true });
+    return true;
+  } catch (err) {
+    toast.err(`No se pudo guardar la contraseña en el Administrador de credenciales (${err}). Vale solo para esta sesión.`);
+    return false;
+  }
+}
+
+/**
+ * Carga las contraseñas guardadas y migra las viejas que estaban en texto plano
+ * en localStorage: se mueven al almacén y se borran del perfil.
+ */
+async function initSecrets() {
+  try {
+    Object.assign(secrets, await call('secret_get_all', { profiles: profiles.map((p) => p.name) }, { quiet: true }));
+  } catch (err) {
+    log('warn', `no se pudieron leer las contraseñas: ${err}`);
+  }
+  const legacy = profiles.filter((p) => p.pass);
+  for (const p of legacy) {
+    if (await saveSecret(p.name, p.pass)) delete p.pass;
+  }
+  if (legacy.length) {
+    store.set('profiles', profiles);
+    log('info', `contraseñas migradas al Administrador de credenciales: ${legacy.map((p) => p.name).join(', ')}`);
+  }
+}
+
 const profile = () => profiles.find((p) => p.name === profileName) || profiles[0];
 function conn() {
   const p = profile() || {};
@@ -121,7 +161,7 @@ function conn() {
     api: p.api || DEFAULTS.api,
     amqp: p.amqp || DEFAULTS.amqp,
     user: p.user || '',
-    pass: p.pass || '',
+    pass: secrets[p.name] ?? p.pass ?? '',
     vhost: p.vhost || '/',
   };
 }
@@ -131,34 +171,86 @@ function renderProfiles() {
   for (const p of profiles) $('profile').add(new Option(p.name, p.name, false, p.name === profileName));
 }
 
+const PROFILE_FIELDS = ['name', 'api', 'amqp', 'user', 'pass', 'vhost'];
+// Resultado de "Probar conexión" para los valores exactos del formulario.
+let lastTest = null; // { key, ok }
+
 function openConnDialog() {
   const form = $('connDialog').querySelector('form');
   const p = profile() || { name: '', ...DEFAULTS };
-  for (const f of ['name', 'api', 'amqp', 'user', 'pass', 'vhost']) form.elements[f].value = p[f] ?? '';
+  for (const f of PROFILE_FIELDS) form.elements[f].value = p[f] ?? '';
+  form.elements.pass.value = secrets[p.name] ?? p.pass ?? '';
   $('connDelete').hidden = profiles.length < 2;
+  $('connTest').hidden = true;
+  lastTest = null;
   $('connDialog').showModal();
 }
 
-$('connDialog').addEventListener('close', () => {
-  if ($('connDialog').returnValue !== 'save') return;
+/** Valores del formulario normalizados (AMQP vacío o en 15672 → host de la API:5672). */
+function formProfile({ announce = false } = {}) {
   const f = $('connDialog').querySelector('form').elements;
-  const p = Object.fromEntries(['name', 'api', 'amqp', 'user', 'pass', 'vhost'].map((k) => [k, f[k].value.trim()]));
-  if (!p.name) return;
-  // AMQP vacío o apuntando al puerto de management: se arma con el host de la API y 5672.
+  const p = Object.fromEntries(PROFILE_FIELDS.map((k) => [k, f[k].value.trim()]));
   const apiHost = p.api.replace(/^https?:\/\//, '').split(/[/:]/)[0];
   if (!p.amqp || /:15672\/?$/.test(p.amqp)) {
     const fixed = `amqp://${apiHost || 'localhost'}:5672`;
-    if (p.amqp) toast.info(`AMQP apuntaba al puerto de management (15672); lo cambié a ${fixed}`);
+    if (p.amqp && announce) toast.info(`AMQP apuntaba al puerto de management (15672); lo cambié a ${fixed}`);
     p.amqp = fixed;
+    f.amqp.value = fixed;
   }
+  return p;
+}
+const profileKey = (p) => JSON.stringify(PROFILE_FIELDS.slice(1).map((k) => p[k]));
+
+function showConnTest(kind, html) {
+  const el = $('connTest');
+  el.hidden = false;
+  el.className = `conn-test conn-test--${kind}`;
+  el.innerHTML = html;
+}
+
+// Probar sin guardar ni cerrar: management (usuario, vhost) y AMQP con los datos del formulario.
+$('connTestBtn').onclick = async () => {
+  const p = formProfile({ announce: true });
+  const c = { api: p.api || DEFAULTS.api, amqp: p.amqp, user: p.user, pass: p.pass, vhost: p.vhost || '/' };
+  showConnTest('', `${bunny('run', 26)}<span>Probando ${esc(hostOf(c))}…</span>`);
+  try {
+    const r = await busy($('connTestBtn'), () => call('ping', { conn: c }));
+    const head = `<b>${esc(r.user)}</b> · vhost ${esc(c.vhost)} · ${fmt(r.queues)} colas`;
+    if (r.amqp_error) {
+      showConnTest('warn', `<span>⚠ ${head}<br>Management OK, pero AMQP falló: ${esc(r.amqp_error)}</span>`);
+      lastTest = { key: profileKey(p), ok: false };
+    } else {
+      showConnTest('ok', `<span>✓ ${head} · AMQP OK</span>`);
+      lastTest = { key: profileKey(p), ok: true };
+    }
+  } catch (err) {
+    showConnTest('bad', `<span>✕ ${esc(err)}</span>`);
+    lastTest = { key: profileKey(p), ok: false };
+  }
+};
+
+$('connDialog').addEventListener('close', () => {
+  if ($('connDialog').returnValue !== 'save') return;
+  const p = formProfile({ announce: true });
+  if (!p.name) return;
+  // Si se probó con éxito exactamente esto, queda conectado al guardar.
+  const tested = lastTest?.ok && lastTest.key === profileKey(p);
+  // La contraseña va al almacén del sistema; el perfil en localStorage queda sin ella.
+  const { pass, ...stored } = p;
+  saveSecret(p.name, pass);
   const i = profiles.findIndex((x) => x.name === p.name);
-  if (i >= 0) profiles[i] = p;
-  else profiles.push(p);
+  if (i >= 0) profiles[i] = stored;
+  else profiles.push(stored);
   selectProfile(p.name);
+  toast.ok(`Perfil “${p.name}” guardado`);
+  if (tested) connect();
 });
 
 $('connDelete').onclick = () => {
-  profiles = profiles.filter((p) => p.name !== profileName);
+  const gone = profileName;
+  profiles = profiles.filter((p) => p.name !== gone);
+  delete secrets[gone];
+  call('secret_delete', { profile: gone }, { quiet: true }).catch((err) => log('warn', `secret_delete ${gone}: ${err}`));
   $('connDialog').close();
   selectProfile(profiles[0].name);
 };
@@ -312,7 +404,7 @@ async function refreshExact(names) {
   names = [...new Set(names.filter(Boolean))];
   if (!names.length) return;
   try {
-    const ready = await call('queues_ready', { conn: conn(), names }, { quiet: true });
+    const { ready } = await call('queues_ready', { conn: conn(), names }, { quiet: true });
     for (const [name, n] of Object.entries(ready)) {
       const q = S.queues.find((x) => x.name === name);
       if (q) {
@@ -390,7 +482,7 @@ $('queues').addEventListener('click', (ev) => {
   if (li.dataset.name !== S.current) {
     setCurrent(li.dataset.name);
     S.qItems = [];
-    S.picks.queue.clear();
+    clearPicks('queue');
     S.peekToken++;
   }
   // Desde la pestaña Archivo, elegir una cola la propone como destino.
@@ -420,8 +512,9 @@ const suggestQueues = (ev) => {
 for (const id of ['target', 'fileTarget', 'confirmQueue']) $(id).addEventListener('input', suggestQueues);
 
 // --- normalización + filtro local -------------------------------------------------
-function normQueueMsg(m, i) {
-  return { ...m, key: i, idx: i + 1 };
+/** `pos`: posición global en la cola (offset de la página + índice). */
+function normQueueMsg(m, pos) {
+  return { ...m, key: pos, idx: pos + 1 };
 }
 function normLocal(b, i) {
   return { ...b, key: `${b.batch}:${b.n}`, idx: i + 1 };
@@ -515,6 +608,7 @@ function applyFilter({ keepScroll = false } = {}) {
   $('empty').hidden = S.view.length > 0;
   renderDetail();
   renderSelection();
+  renderPager();
 }
 
 let filterTimer = 0;
@@ -549,12 +643,22 @@ function createRow() {
 const relTime = (ts) => new Date(ts).toLocaleString('es', { dateStyle: 'short', timeStyle: 'medium' });
 const fmtSize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1048576).toFixed(1)} MB`);
 
+/** Qué significa cada estado del respaldo (tooltip de la fila). */
+const STATUS_HELP = {
+  pending: 'pending: respaldado, sin publicar ni sacar → sigue en la cola de origen',
+  published: 'published: llegó al destino pero no se sacó del origen (se cortó entre ambos pasos) → posible duplicado',
+  done: 'done: procesado completo',
+  error: 'error: falló al publicar → sigue en la cola de origen',
+  republished: 'republished: re-publicado desde este respaldo',
+};
+
 function updateRow(row, it, i) {
   row._check.checked = picks().has(it.key);
   row.classList.toggle('sel', i === S.sel);
   row.classList.toggle('picked', row._check.checked);
   row._idx.textContent = it.idx;
 
+  row.title = STATUS_HELP[it.status] ?? '';
   if (S.tab === 'local') {
     row._t1.className = `tag tag--${it.status}`;
     row._t1.textContent = it.status;
@@ -565,8 +669,8 @@ function updateRow(row, it, i) {
   } else if (S.tab === 'file') {
     row._t1.className = 'tag';
     row._t1.textContent = 'archivo';
-    row._t2.className = 'tag';
-    row._t2.textContent = '';
+    row._t2.className = it.sentTo ? 'tag tag--done' : 'tag';
+    row._t2.textContent = it.sentTo ? `publicado → ${it.sentTo}` : '';
     row._rk.textContent = it.routing_key || S.fileName;
     row._info.textContent = `${fmtSize(it.size)}${it.properties?.content_type ? ' · ' + it.properties.content_type : ''}`;
   } else {
@@ -604,36 +708,63 @@ function select(i) {
   renderDetail();
 }
 
+/** Marca o desmarca un item. En la cola guarda su huella: la selección sobrevive al
+ *  cambiar de página y "Mover seleccionados" la necesita aunque no esté a la vista. */
+function setPick(it, on) {
+  const set = picks();
+  if (on) {
+    set.add(it.key);
+    if (S.tab === 'queue') S.qfp.set(it.key, it.fp);
+  } else {
+    set.delete(it.key);
+    if (S.tab === 'queue') S.qfp.delete(it.key);
+  }
+  if (S.tab === 'queue') S.allQueue = false;
+}
+
+function clearPicks(tab = S.tab) {
+  S.picks[tab].clear();
+  if (tab === 'queue') {
+    S.qfp.clear();
+    S.allQueue = false;
+  }
+}
+
 function toggleCheck(i, range) {
   const it = S.view[i];
-  const set = picks();
-  const on = !set.has(it.key);
+  const on = !picks().has(it.key);
   const [a, b] = range && S.lastCheck >= 0 ? [Math.min(S.lastCheck, i), Math.max(S.lastCheck, i)] : [i, i];
-  for (let k = a; k <= b; k++) {
-    if (on) set.add(S.view[k].key);
-    else set.delete(S.view[k].key);
-  }
+  for (let k = a; k <= b; k++) setPick(S.view[k], on);
   S.lastCheck = i;
   list.refresh();
   renderSelection();
 }
 
+const queueReady = () => S.msgPage?.ready ?? S.currentInfo?.ready ?? 0;
+
 /** Contador de seleccionados y textos de los botones según la pestaña. */
 function renderSelection() {
   const set = picks();
-  const n = set.size;
+  const all = S.tab === 'queue' && S.allQueue;
+  const n = all ? queueReady() : set.size;
   const visibleChecked = S.view.length > 0 && S.view.every((it) => set.has(it.key));
-  $('selAll').checked = visibleChecked;
-  $('selAll').indeterminate = !visibleChecked && S.view.some((it) => set.has(it.key));
+  $('selAll').checked = all || visibleChecked;
+  $('selAll').indeterminate = !all && !visibleChecked && S.view.some((it) => set.has(it.key));
   $('selAll').disabled = !S.view.length;
   $('selCount').hidden = n === 0;
-  $('selCount').textContent = `${fmt(n)} seleccionados ✕`;
+  $('selCount').textContent = all ? `Toda la cola (${fmt(n)}) ✕` : `${fmt(n)} seleccionados ✕`;
   $('selCount').title = 'Quitar la selección';
+
+  // Como Gmail: con la página entera marcada (y sin filtro), ofrecer toda la cola.
+  const offerAll =
+    S.tab === 'queue' && !all && visibleChecked && !$('filter').value.trim() && queueReady() > set.size;
+  $('selQueue').hidden = !offerAll;
+  $('selQueue').textContent = `Seleccionar los ${fmt(queueReady())} de la cola`;
 
   const busyOp = !!S.op;
   if (S.tab === 'queue') {
-    $('ack').textContent = n ? `Ack ${fmt(n)} sel.` : 'Ack N';
-    $('move').textContent = n ? `Mover ${fmt(n)} sel. →` : 'Mover N →';
+    $('ack').textContent = all ? `Ack todos (${fmt(n)})` : n ? `Ack ${fmt(n)} sel.` : 'Ack N';
+    $('move').textContent = all ? `Mover todos (${fmt(n)}) →` : n ? `Mover ${fmt(n)} sel. →` : 'Mover N →';
   } else if (S.tab === 'file') {
     const visible = S.view.length;
     $('publishFile').textContent = n ? `Publicar ${fmt(n)} sel. →` : `Publicar ${fmt(visible)} →`;
@@ -648,14 +779,19 @@ function renderSelection() {
 
 $('selAll').onchange = () => {
   const on = $('selAll').checked;
-  const set = picks();
-  for (const it of S.view) on ? set.add(it.key) : set.delete(it.key);
+  if (!on && S.tab === 'queue') S.allQueue = false;
+  for (const it of S.view) setPick(it, on);
   list.refresh();
   renderSelection();
 };
 $('selCount').onclick = () => {
-  picks().clear();
+  clearPicks();
   list.refresh();
+  renderSelection();
+};
+$('selQueue').onclick = () => {
+  S.allQueue = true;
+  log('info', `seleccionada toda la cola ${S.current} (${queueReady()} ready)`);
   renderSelection();
 };
 
@@ -746,8 +882,9 @@ function endOp() {
 }
 
 function setActionsDisabled(on) {
-  for (const id of ['peek', 'ack', 'move']) $(id).disabled = on;
+  for (const id of ['peek', 'ack', 'move', 'countAll']) $(id).disabled = on;
   renderSelection();
+  renderPager();
 }
 
 listen('progress', ({ payload }) => updateOp(payload.done, payload.total));
@@ -763,15 +900,60 @@ function lastOp(text) {
 }
 
 // --- confirmación -----------------------------------------------------------------
-function ask({ title, body, ok = 'Aceptar', danger = false, queue = null }) {
+/**
+ * Ambiente más riesgoso entre las colas tocadas (y el perfil/vhost como señal
+ * extra). `confirm` es la cola que hay que escribir en PROD.
+ */
+function envFor(queues, confirm) {
+  const env = worstEnv([...queues, profile()?.name, conn().vhost]);
+  return env && { ...env, confirm: confirm ?? queues.find(Boolean) };
+}
+
+/**
+ * Diálogo de confirmación. Con `env`: PROD en rojo y hay que escribir el nombre
+ * de la cola; QA en naranja con aceptar; DEV en azul.
+ */
+function ask({ title, body, ok = 'Aceptar', danger = false, queue = null, env = null, count = 0, check = null }) {
   return new Promise((resolve) => {
     const d = $('confirmDialog');
+    d.classList.remove('modal--prod', 'modal--qa', 'modal--dev');
     $('confirmTitle').textContent = title;
     $('confirmBody').textContent = body;
     $('confirmOk').textContent = ok;
     $('confirmOk').className = `btn ${danger ? 'btn--danger' : 'btn--primary'}`;
     $('confirmQueueWrap').hidden = queue === null;
     if (queue !== null) $('confirmQueue').value = queue;
+
+    // Casilla opcional (p. ej. "incluir los ya publicados"); el que llama lee $('confirmCheck').
+    $('confirmCheckWrap').hidden = !check;
+    $('confirmCheck').checked = !!check?.checked;
+    $('confirmCheckLabel').textContent = check?.label ?? '';
+
+    $('envBanner').hidden = !env;
+    const mustType = env?.level === 'prod' ? env.confirm : null;
+    $('confirmTypeWrap').hidden = !mustType;
+    $('confirmType').value = '';
+    $('confirmType').classList.remove('ok');
+    $('confirmOk').disabled = !!mustType;
+    if (env) {
+      const info = ENV_INFO[env.level];
+      d.classList.add(`modal--${env.level}`);
+      // Escena del conejo rezando en todos los ambientes (el color del banner dice
+      // cuál es); el terror sube cada 10k mensajes.
+      const level = terrorLevel(count);
+      $('envIcon').innerHTML = terrorScene(level);
+      $('envTitle').textContent = info.title;
+      const fear = level === 5 ? `Que Dios te acompañe con ${fmt(count)} mensajes.` : TERROR_TEXT[level];
+      $('envText').innerHTML = `${esc(info.text)} Detectado por “${esc(env.name)}”.${fear ? `<em id="envFear">${esc(fear)}</em>` : ''}`;
+      $('confirmTypeName').textContent = mustType ?? '';
+      log('info', `confirmación ${env.level} por "${env.name}": ${title}`);
+    }
+    $('confirmType').oninput = () => {
+      const match = $('confirmType').value.trim() === mustType;
+      $('confirmOk').disabled = !match;
+      $('confirmType').classList.toggle('ok', match);
+    };
+
     d.returnValue = '';
     d.addEventListener(
       'close',
@@ -779,30 +961,41 @@ function ask({ title, body, ok = 'Aceptar', danger = false, queue = null }) {
       { once: true }
     );
     d.showModal();
-    (queue !== null ? $('confirmQueue') : $('confirmOk')).focus();
+    (mustType ? $('confirmType') : queue !== null ? $('confirmQueue') : $('confirmOk')).focus();
   });
 }
 
 // --- acciones de cola ---------------------------------------------------------------
-const count = () => Math.min(MAX_N, Math.max(1, parseInt($('count').value, 10) || 1));
+// Sin tope: para ack/mover N puede ser 200k o más (se procesa en lotes).
+const count = () => Math.max(1, parseInt($('count').value, 10) || 1);
+const pageSize = () => Number($('pageSize').value) || 100;
 
-async function peek() {
+/**
+ * Lee una página (`offset`, tamaño de página) y la devuelve a la cola. Para llegar
+ * a una página lejana el backend recorre las anteriores sin guardarlas.
+ * `fresh`: lectura nueva desde "Ver" (descarta la selección anterior).
+ */
+async function peek(offset = 0, { fresh = false } = {}) {
   if (!S.current || S.op) return;
   const queue = S.current;
   const token = ++S.peekToken;
-  const n = count();
-  startOp(`Descargando hasta ${fmt(n)} mensajes de ${queue}…`, n, { mode: 'run' });
-  showSkeleton(true, `Descargando mensajes de ${queue}…`);
+  const limit = pageSize();
+  const range = `${fmt(offset + 1)}–${fmt(offset + limit)}`;
+  startOp(offset ? `Recorriendo ${fmt(offset)} mensajes para llegar a ${range} de ${queue}…` : `Descargando ${range} de ${queue}…`, offset + limit, { mode: 'run', cancellable: true });
+  showSkeleton(true, `Descargando mensajes ${range} de ${queue}…`);
   try {
-    const r = await atLeast(call('peek', { conn: conn(), queue, count: n }), MIN_ANIM_MS);
+    const r = await atLeast(call('peek', { conn: conn(), queue, offset, limit }), MIN_ANIM_MS);
     if (token !== S.peekToken || queue !== S.current) return;
     refreshExact([queue]);
-    S.qItems = r.map(normQueueMsg);
-    // Las claves son posiciones de esta lectura: una selección anterior ya no aplica.
-    S.picks.queue.clear();
+    // Todo lo leído vuelve a la cola igual; cancelar solo deja la página incompleta.
+    if (r.cancelled) toast.info('Lectura cancelada: los mensajes volvieron a la cola');
+    else if (r.stalled) toast.info(`La cola dejó de entregar antes de completar la página (¿otro consumidor activo?). Se muestran ${fmt(r.items.length)}.`);
+    S.msgPage = { offset: r.offset, limit, ready: r.ready };
+    S.qItems = r.items.map((m, i) => normQueueMsg(m, r.offset + i));
+    if (fresh) clearPicks('queue');
     S.sel = S.qItems.length ? 0 : -1;
     if (S.tab === 'queue') applyFilter();
-    lastOp(`${fmt(r.length)} mensajes leídos de ${queue}`);
+    lastOp(`${fmt(r.items.length)} mensajes leídos de ${queue} (${range} de ${fmt(r.ready)})`);
   } catch (err) {
     toast.err(`Error leyendo ${queue}: ${err}`);
   } finally {
@@ -810,6 +1003,31 @@ async function peek() {
     endOp();
   }
 }
+
+function renderPager() {
+  const p = S.msgPage;
+  const show = S.tab === 'queue' && !!p && !!S.qItems.length;
+  $('msgPager').hidden = !show;
+  if (!show) return;
+  $('msgPageInfo').textContent = `${fmt(p.offset + 1)}–${fmt(p.offset + S.qItems.length)} de ${fmt(p.ready)}`;
+  $('msgPrev').disabled = p.offset === 0 || !!S.op;
+  $('msgNext').disabled = p.offset + p.limit >= p.ready || !!S.op;
+}
+$('msgPrev').onclick = () => S.msgPage && peek(Math.max(0, S.msgPage.offset - S.msgPage.limit));
+$('msgNext').onclick = () => S.msgPage && peek(S.msgPage.offset + S.msgPage.limit);
+$('pageSize').value = String(store.get('pageSize', 500));
+$('pageSize').onchange = () => store.set('pageSize', pageSize());
+$('countAll').onclick = async () => {
+  if (!S.current) return toast.err('Elegí una cola');
+  try {
+    const { ready, errors } = await busy($('countAll'), () => call('queues_ready', { conn: conn(), names: [S.current] }));
+    if (!(S.current in ready)) return toast.err(`Cola “${S.current}”: ${errors[S.current] ?? 'no accesible'}`);
+    $('count').value = ready[S.current];
+    toast.info(`N = ${fmt(ready[S.current])} (todos los ready de ${S.current})`);
+  } catch (err) {
+    toast.err(`No se pudo leer la cola: ${err}`);
+  }
+};
 
 /** Esqueleto de filas con el conejo corriendo encima mientras carga la lista. */
 function showSkeleton(on, text = 'Cargando…') {
@@ -831,9 +1049,10 @@ function showSkeleton(on, text = 'Cargando…') {
 async function checkQueues(source, target, btn) {
   try {
     const names = target ? [source, target] : [source];
-    const exact = await busy(btn, () => call('queues_ready', { conn: conn(), names }));
-    if (target && !(target in exact)) return toast.err(`La cola destino “${target}” no existe o no es accesible`), null;
-    if (!(source in exact)) return toast.err(`No se pudo leer “${source}”`), null;
+    const { ready: exact, errors } = await busy(btn, () => call('queues_ready', { conn: conn(), names }));
+    // El backend dice el motivo real: no existe, sin permiso, cola exclusiva…
+    if (target && !(target in exact)) return toast.err(`Cola destino “${target}”: ${errors[target] ?? 'no accesible'}`), null;
+    if (!(source in exact)) return toast.err(`Cola “${source}”: ${errors[source] ?? 'no accesible'}`), null;
     refreshExact(names);
     if (!exact[source]) return toast.info(`“${source}” no tiene mensajes ready`), null;
     return exact[source];
@@ -846,21 +1065,27 @@ async function checkQueues(source, target, btn) {
 /** Ack/Mover: con mensajes seleccionados actúa sobre esos; si no, sobre los primeros N. */
 async function drain(target) {
   if (!S.current || S.op) return;
-  if (S.picks.queue.size) return drainSelected(target);
+  if (!S.allQueue && S.picks.queue.size) return drainSelected(target);
   const source = S.current;
-  const asked = count();
+  const all = S.allQueue;
 
   // Cantidad real: lo pedido acotado a lo que hay ready ahora (AMQP, sin el atraso
   // de las estadísticas). Así el diálogo no promete mover 100 si hay 5.
   const ready = await checkQueues(source, target, $(target ? 'move' : 'ack'));
   if (ready == null) return;
+  const asked = all ? ready : count();
   const n = Math.min(asked, ready);
-  const note = asked > ready ? `\nPediste ${fmt(asked)}, pero la cola tiene ${fmt(ready)} ready.` : `\nLa cola tiene ${fmt(ready)} ready.`;
+  const note = all
+    ? `\nToda la cola: ${fmt(ready)} ready ahora.`
+    : asked > ready
+      ? `\nPediste ${fmt(asked)}, pero la cola tiene ${fmt(ready)} ready.`
+      : `\nLa cola tiene ${fmt(ready)} ready.`;
+  const qty = all ? `todos los ${fmt(n)}` : fmt(n);
 
   const yes = await ask(
     target
-      ? { title: `Mover ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `De “${source}” a “${target}”.${note}\n\nSe guarda un respaldo nuevo de este envío, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover' }
-      : { title: `Ack de ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `Se sacan de “${source}”.${note}\n\nQuedan en un respaldo nuevo y se pueden volver a cargar desde “Último respaldo”.`, ok: 'Sacar mensajes', danger: true }
+      ? { title: `Mover ${qty} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `De “${source}” a “${target}”.${note}\n\nSe guarda un respaldo nuevo de este envío, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover', env: envFor([target, source], target), count: n }
+      : { title: `Ack de ${qty} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `Se sacan de “${source}”.${note}\n\nQuedan en un respaldo nuevo y se pueden volver a cargar desde “Último respaldo”.`, ok: 'Sacar mensajes', danger: true, env: envFor([source]), count: n }
   );
   if (!yes) return;
 
@@ -871,14 +1096,15 @@ async function drain(target) {
     const verb = target ? 'movidos' : 'ackeados';
     if (r.total === 0) toast.info(`“${source}” no tiene mensajes ready`);
     else if (r.failed.length) toast.err(`${fmt(r.ok)} ${verb}, falló: ${r.failed[0]}. Los fallidos siguen en origen.`);
-    else if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} ${verb}`);
+    else if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} ${verb}; el resto sigue en la cola`);
+    else if (r.stalled) toast.info(`${fmt(r.ok)} de ${fmt(r.total)} ${verb}: la cola dejó de entregar (¿otro consumidor activo?). El resto sigue en la cola.`);
     else {
       toast.ok(`${fmt(r.ok)} mensajes ${verb}${target ? ` a ${target}` : ''}`);
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} ${verb} de ${source}`);
   } catch (err) {
-    toast.err(`Error: ${err}. Lo procesado quedó en el respaldo local.`);
+    toast.err(`Error: ${err}. ${INTERRUPTED_HINT}`);
   } finally {
     showSkeleton(false);
     endOp();
@@ -886,7 +1112,8 @@ async function drain(target) {
   // Lo leído ya no refleja la cola. Los contadores de origen y destino se toman
   // exactos por AMQP; un refresco completo de la página corregiría con datos viejos.
   S.qItems = [];
-  S.picks.queue.clear();
+  S.msgPage = null;
+  clearPicks('queue');
   applyFilter();
   refreshExact([source, target]);
   showLatestBackup();
@@ -898,30 +1125,33 @@ async function drain(target) {
  */
 async function drainSelected(target) {
   const source = S.current;
-  const chosen = pickedItems('queue');
-  const k = chosen.length;
+  // Seleccionados de cualquier página: posición en la cola → huella.
+  const keys = [...S.picks.queue];
+  const fps = keys.map((k) => S.qfp.get(k)).filter(Boolean);
+  const k = fps.length;
   if (!k) return;
   if ((await checkQueues(source, target, $(target ? 'move' : 'ack'))) == null) return;
-  // Lo leído son los primeros mensajes de la cola: se recorre esa ventana más un margen.
-  const scan = S.qItems.length + 50;
+  // Se recorre hasta el seleccionado más lejano, más un margen por si se corrieron.
+  const scan = keys.reduce((m, x) => Math.max(m, x), 0) + 1 + 50;
   const what = `${fmt(k)} ${k === 1 ? 'mensaje seleccionado' : 'mensajes seleccionados'}`;
   const how = `\n\nSe recorren hasta ${fmt(scan)} mensajes del principio de la cola para encontrarlos; los no seleccionados vuelven a la cola en su orden. Se guarda un respaldo nuevo antes de cualquier ack.`;
   const yes = await ask(
     target
-      ? { title: `Mover ${what}`, body: `De “${source}” a “${target}”.${how}`, ok: 'Mover' }
-      : { title: `Ack de ${what}`, body: `Se sacan de “${source}”.${how}`, ok: 'Sacar mensajes', danger: true }
+      ? { title: `Mover ${what}`, body: `De “${source}” a “${target}”.${how}`, ok: 'Mover', env: envFor([target, source], target), count: k }
+      : { title: `Ack de ${what}`, body: `Se sacan de “${source}”.${how}`, ok: 'Sacar mensajes', danger: true, env: envFor([source]), count: k }
   );
   if (!yes) return;
 
-  startOp(target ? `Moviendo ${what} → ${target}` : `Ackeando ${what}`, k, { mode: 'run' });
+  startOp(target ? `Moviendo ${what} → ${target}` : `Ackeando ${what}`, k, { mode: 'run', cancellable: true });
   showSkeleton(true, target ? `Moviendo seleccionados a ${target}…` : `Sacando seleccionados de ${source}…`);
   try {
     const r = await atLeast(
-      call('move_selected', { conn: conn(), source, target: target || null, fps: chosen.map((it) => it.fp), scan }),
+      call('move_selected', { conn: conn(), source, target: target || null, fps, scan }),
       MIN_ANIM_MS
     );
     const verb = target ? 'movidos' : 'ackeados';
     if (r.failed.length) toast.err(`${fmt(r.ok)} ${verb}, falló: ${r.failed[0]}. Los fallidos siguen en origen.`);
+    else if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} seleccionados ${verb}; el resto sigue en la cola`);
     else if (r.not_found) toast.info(`${fmt(r.ok)} de ${fmt(r.total)} ${verb}. ${fmt(r.not_found)} ya no estaban en la cola (los consumió otro o cambiaron).`);
     else if (r.ok) {
       toast.ok(`${fmt(r.ok)} seleccionados ${verb}${target ? ` a ${target}` : ''}`);
@@ -939,10 +1169,13 @@ async function drainSelected(target) {
       gone.set(it.fp, c - 1);
       return false;
     });
-    S.qItems = remaining.map((it, i) => ({ ...it, key: i, idx: i + 1 }));
-    S.picks.queue.clear();
+    // Las posiciones de toda la cola se corrieron: se renumera esta página.
+    const base = S.msgPage?.offset ?? 0;
+    S.qItems = remaining.map((it, i) => ({ ...it, key: base + i, idx: base + i + 1 }));
+    if (S.msgPage) S.msgPage.ready = Math.max(0, S.msgPage.ready - r.ok);
+    clearPicks('queue');
   } catch (err) {
-    toast.err(`Error: ${err}. Lo procesado quedó en el respaldo local.`);
+    toast.err(`Error: ${err}. ${INTERRUPTED_HINT}`);
   } finally {
     showSkeleton(false);
     endOp();
@@ -952,7 +1185,11 @@ async function drainSelected(target) {
   showLatestBackup();
 }
 
-$('peek').onclick = peek;
+/** Qué hacer tras una interrupción: el respaldo dice dónde quedó cada mensaje. */
+const INTERRUPTED_HINT =
+  'Revisá “Último respaldo”: “pending” = sigue en origen; “published” = llegó al destino pero no se sacó del origen (posible duplicado).';
+
+$('peek').onclick = () => peek(0, { fresh: true });
 $('ack').onclick = () => drain(null);
 $('move').onclick = () => {
   const t = $('target').value.trim();
@@ -997,21 +1234,31 @@ $('publishFile').onclick = async () => {
   if (!queue) return toast.err('Elegí la cola destino');
   // Seleccionados, o todos los que deja ver el filtro.
   const chosen = S.picks.file.size ? pickedItems('file') : S.view;
-  const k = chosen.length;
-  if (!k) return;
+  if (!chosen.length) return;
+  // Los ya publicados se excluyen salvo que se pida lo contrario (evita duplicar
+  // tras un corte o un reintento).
+  const already = chosen.filter((it) => it.sentTo).length;
+  const k = chosen.length - already;
   const yes = await ask({
-    title: `Publicar ${fmt(k)} ${k === 1 ? 'mensaje' : 'mensajes'} en “${queue}”`,
+    title: `Publicar ${fmt(already && !k ? chosen.length : k)} ${k === 1 ? 'mensaje' : 'mensajes'} en “${queue}”`,
     body: `Desde ${S.fileName}${S.picks.file.size ? ' (seleccionados)' : $('filter').value ? ' (los que pasan el filtro)' : ''}.\n\nPersistentes y con content_type application/json, salvo que el elemento traiga sus propias properties. Con confirmación del broker.`,
     ok: 'Publicar',
+    env: envFor([queue]),
+    count: k || chosen.length,
+    check: already ? { label: `Incluir ${fmt(already)} que ya se publicaron (duplicarían)`, checked: !k } : null,
   });
   if (!yes) return;
-  startOp(`Publicando en ${queue}`, k, { mode: 'hop' });
+  const send = already && $('confirmCheck').checked ? chosen : chosen.filter((it) => !it.sentTo);
+  if (!send.length) return;
+  startOp(`Publicando en ${queue}`, send.length, { mode: 'hop', cancellable: true });
   try {
     const r = await atLeast(
-      call('publish_messages', { conn: conn(), queue, messages: chosen.map((it) => ({ payload: it.payload, properties: it.properties })) }),
+      call('publish_messages', { conn: conn(), queue, messages: send.map((it) => ({ payload: it.payload, properties: it.properties })) }),
       MIN_ANIM_MS
     );
-    if (r.failed.length) toast.err(`${fmt(r.ok)} de ${fmt(r.total)} publicados; falló: ${r.failed[0]}`);
+    for (const i of r.published) send[i].sentTo = queue;
+    if (r.failed.length) toast.err(`${fmt(r.ok)} de ${fmt(r.total)} publicados; falló: ${r.failed[0]}. Los publicados quedan marcados y se excluyen al reintentar.`);
+    else if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} publicados (quedan marcados)`);
     else {
       toast.ok(`${fmt(r.ok)} mensajes publicados en ${queue}`);
       bunnyDash();
@@ -1029,7 +1276,8 @@ $('publishFile').onclick = async () => {
 
 // --- respaldo local (uno por envío; la pestaña muestra el último) ---------------------
 const bkpLabel = (b) =>
-  `${relTime(b.ts)} · ${b.op === 'move' ? 'mover' : 'ack'} · ${b.source}${b.target ? ` → ${b.target}` : ''} · ${fmt(b.count)} msgs`;
+  `${relTime(b.ts)} · ${b.op === 'move' ? 'mover' : 'ack'} · ${b.source}${b.target ? ` → ${b.target}` : ''} · ${fmt(b.count)} msgs` +
+  ((b.pending || 0) + (b.published || 0) ? ` · ⚠ ${fmt((b.pending || 0) + (b.published || 0))} sin resolver` : '');
 
 /** Lista de respaldos para el selector; el badge muestra el tamaño del último. */
 async function loadBackups() {
@@ -1080,19 +1328,46 @@ $('republishSel').onclick = async () => {
   // Seleccionados, o todos los visibles del respaldo.
   const chosen = S.picks.local.size ? pickedItems('local') : S.view;
   if (!chosen.length) return;
+  // Avisos que evitan duplicar: lo ya re-publicado se excluye por defecto, y
+  // "published" (llegó al destino pero no se sacó del origen) puede estar repetido.
+  const again = chosen.filter((it) => it.status === 'republished');
+  const dupRisk = chosen.filter((it) => it.status === 'published').length;
+  const fresh = chosen.length - again.length;
+  const notes = [
+    again.length ? `${fmt(again.length)} ya fueron re-publicados (a ${[...new Set(again.map((it) => it.republished_to || '?'))].join(', ')}).` : '',
+    dupRisk ? `${fmt(dupRisk)} están “published”: llegaron al destino pero no se sacaron del origen; re-publicarlos puede duplicarlos.` : '',
+  ].filter(Boolean);
   const queue = await ask({
-    title: `Re-publicar ${fmt(chosen.length)} mensajes`,
-    body: 'Se publican con sus properties y headers originales, con confirmación del broker. Por defecto, en la cola de donde salieron.',
+    title: `Re-publicar ${fmt(fresh || chosen.length)} mensajes`,
+    body: `Se publican con sus properties y headers originales, con confirmación del broker. Por defecto, en la cola de donde salieron.${notes.length ? `\n\n⚠ ${notes.join('\n⚠ ')}` : ''}`,
     ok: 'Re-publicar',
     queue: chosen[0].source || S.current || '',
+    check: again.length ? { label: `Incluir los ${fmt(again.length)} ya re-publicados`, checked: !fresh } : null,
   });
   if (!queue) return;
-  startOp(`Re-publicando en ${queue}`, chosen.length, { mode: 'hop' });
+  const send = again.length && !$('confirmCheck').checked ? chosen.filter((it) => it.status !== 'republished') : chosen;
+  if (!send.length) return;
+  // La cola recién se conoce acá: si es de un ambiente sensible, segunda confirmación.
+  const env = envFor([queue]);
+  if (env) {
+    const sure = await ask({
+      title: `Cargar ${fmt(send.length)} mensajes en “${queue}”`,
+      body: 'Se re-publican desde el respaldo con sus properties y headers originales.',
+      ok: 'Re-publicar',
+      env,
+      count: send.length,
+    });
+    if (!sure) return;
+  }
+  startOp(`Re-publicando en ${queue}`, send.length, { mode: 'hop', cancellable: true });
   try {
-    const n = await atLeast(call('republish', { conn: conn(), items: refsOf(chosen), queue }), MIN_ANIM_MS);
-    toast.ok(`${fmt(n)} mensajes re-publicados en ${queue}`);
-    bunnyDash();
-    lastOp(`${fmt(n)} re-publicados en ${queue}`);
+    const r = await atLeast(call('republish', { conn: conn(), items: refsOf(send), queue }), MIN_ANIM_MS);
+    if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} re-publicados en ${queue}`);
+    else {
+      toast.ok(`${fmt(r.ok)} mensajes re-publicados en ${queue}`);
+      bunnyDash();
+    }
+    lastOp(`${fmt(r.ok)} re-publicados en ${queue}`);
     S.picks.local.clear();
   } catch (err) {
     toast.err(`Re-publicación interrumpida: ${err}`);
@@ -1106,11 +1381,11 @@ $('republishSel').onclick = async () => {
 $('deleteSel').onclick = async () => {
   const chosen = pickedItems('local');
   if (!chosen.length) return;
-  const pending = chosen.filter((it) => it.status !== 'done' && it.status !== 'republished').length;
+  const unresolved = chosen.filter((it) => it.status === 'pending' || it.status === 'published').length;
   const yes = await ask({
     title: `Borrar ${fmt(chosen.length)} del respaldo`,
-    body: pending
-      ? `Atención: ${fmt(pending)} no están en estado done/republished.\nEsto no se puede deshacer.`
+    body: unresolved
+      ? `Atención: ${fmt(unresolved)} están “pending” o “published” (se cortó la operación): el respaldo puede ser la única copia confiable.\nEsto no se puede deshacer.`
       : 'Esto no se puede deshacer.',
     ok: 'Borrar',
     danger: true,
@@ -1271,11 +1546,86 @@ call('backup_path', undefined, { quiet: true }).then((p) => {
 call('log_path', undefined, { quiet: true }).then((p) => ($('openLog').title = `Abrir carpeta del log: ${p}`));
 $('openLog').onclick = () => call('reveal_log', undefined, { quiet: true }).catch((err) => toast.err(`No se pudo abrir el log: ${err}`));
 
+// --- retención y borrado de respaldos --------------------------------------------
+$('retention').value = String(store.get('retentionDays', 30));
+async function pruneBackups() {
+  const days = Number($('retention').value);
+  if (!days) return;
+  try {
+    const r = await call('prune_backups', { days }, { quiet: true });
+    if (r.removed) log('info', `retención ${days} días: ${r.removed} respaldos borrados`);
+    if (r.kept_unresolved) log('info', `retención: ${r.kept_unresolved} respaldos viejos conservados por tener pending/published`);
+  } catch (err) {
+    log('warn', `retención: ${err}`);
+  }
+}
+$('retention').onchange = async () => {
+  store.set('retentionDays', Number($('retention').value));
+  await pruneBackups();
+  S.backupId = null;
+  if (S.tab === 'local') loadLocal();
+  else loadBackups().catch(() => {});
+};
+
+$('deleteRun').onclick = async () => {
+  const b = S.backups?.find((x) => x.id === S.backupId);
+  if (!b) return;
+  const unresolved = (b.pending || 0) + (b.published || 0);
+  const yes = await ask({
+    title: 'Borrar el respaldo completo',
+    body: `${bkpLabel(b)}${unresolved ? `\n\n⚠ Tiene ${fmt(unresolved)} mensajes “pending”/“published” (la operación se cortó): puede ser la única copia confiable.` : ''}\n\nEsto no se puede deshacer.`,
+    ok: 'Borrar respaldo',
+    danger: true,
+  });
+  if (!yes) return;
+  try {
+    await call('delete_backup', { id: b.id });
+    toast.ok('Respaldo borrado');
+    S.backupId = null;
+    clearPicks('local');
+    S.localItems = [];
+    loadLocal();
+  } catch (err) {
+    toast.err(`No se pudo borrar el respaldo: ${err}`);
+  }
+};
+
+// --- cierre con una operación en curso ------------------------------------------------
+// Cerrar a mitad de camino no pierde mensajes (el broker reencola lo no confirmado),
+// pero puede dejar entradas "published" (posibles duplicados). Se pide confirmar.
+{
+  const win = window.__TAURI__.window?.getCurrentWindow?.();
+  let closing = false;
+  win?.onCloseRequested(async (ev) => {
+    if (!S.op || closing) return;
+    ev.preventDefault();
+    const yes = await ask({
+      title: 'Hay una operación en curso',
+      body: `${S.op.label}\n\nSi cerrás ahora se cancela al terminar el lote actual: lo no procesado vuelve a la cola y el respaldo queda con el detalle (“published” = posible duplicado).`,
+      ok: 'Cancelar y cerrar',
+      danger: true,
+    });
+    if (!yes) return;
+    closing = true;
+    log('warn', `cierre con operación en curso: ${S.op?.label}`);
+    await call('cancel', undefined, { quiet: true }).catch(() => {});
+    // Hasta 10 s para que el lote en curso termine limpio.
+    for (let i = 0; i < 50 && S.op; i++) await new Promise((r) => setTimeout(r, 200));
+    await win.destroy();
+  });
+}
+
+// --- seguridad: la CSP bloquea lo que no sea de la app; queda registrado ------------
+document.addEventListener('securitypolicyviolation', (ev) =>
+  log('error', `CSP bloqueó ${ev.violatedDirective}: ${ev.blockedURI || '(inline)'} en ${ev.sourceFile}:${ev.lineNumber}`)
+);
+
 renderProfiles();
 setConnected(false);
 requestAnimationFrame(placeIndicator);
 window.addEventListener('resize', placeIndicator);
 renderQueues();
 applyFilter();
-loadBackups().catch(() => {});
 setConn('', `Perfil ${profile()?.name ?? ''} — sin conectar`);
+initSecrets().finally(() => log('info', 'UI lista'));
+pruneBackups().finally(() => loadBackups().catch(() => {}));
