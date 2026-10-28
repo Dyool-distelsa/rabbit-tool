@@ -25,13 +25,35 @@ use std::path::{Path, PathBuf};
 const EXT: &str = ".bkp.jsonl";
 const META_EXT: &str = ".meta.json";
 
-#[derive(Serialize, Deserialize, Clone)]
+/// Cabecera de un envío. Los campos con `default` se agregaron después: los
+/// respaldos viejos se siguen leyendo.
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Header {
     pub id: String,
     pub ts: u64,
-    pub op: String, // "ack" | "move"
+    /// "ack" | "move" | "publish" (desde archivo) | "republish" (desde respaldo)
+    pub op: String,
     pub source: String,
     pub target: Option<String>,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub vhost: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub app_version: String,
+    /// Respaldo del que sale esta versión (re-publicar desde un respaldo).
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// De dónde vinieron los mensajes: "queue:<cola>", "file:<archivo>", "backup:<id>".
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Filtro local que estaba aplicado al elegir los mensajes.
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -48,12 +70,30 @@ pub struct Entry {
     pub republished_to: Option<String>,
 }
 
-/// Resumen de un envío: cabecera + cantidad de entradas por estado.
+/// Resumen de un envío: cabecera + cantidad de entradas por estado, tamaño y cómo
+/// terminó.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Meta {
     #[serde(flatten)]
     pub header: Header,
     pub counts: BTreeMap<String, u32>,
+    /// Bytes de payload respaldados.
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub finished_ts: Option<u64>,
+    /// "ok" | "partial" | "cancelled" | "stalled" | "error"; None = no terminó
+    /// (se cortó la app o la conexión a mitad).
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Bytes reales de un payload en base64 (sin decodificarlo).
+fn b64_len(s: &str) -> u64 {
+    let pad = s.bytes().rev().take_while(|&b| b == b'=').count();
+    (s.len() / 4 * 3).saturating_sub(pad) as u64
 }
 
 impl Meta {
@@ -84,6 +124,13 @@ enum Line {
     },
     Deleted {
         n: u32,
+    },
+    /// Cierre del envío: cuándo y cómo terminó.
+    End {
+        ts: u64,
+        outcome: String,
+        #[serde(default)]
+        error: Option<String>,
     },
 }
 
@@ -124,6 +171,7 @@ pub struct Writer {
     dir: PathBuf,
     meta: Meta,
     status: HashMap<u32, String>,
+    sizes: HashMap<u32, u64>,
 }
 
 impl Writer {
@@ -134,8 +182,15 @@ impl Writer {
             .append(true)
             .open(path(dir, &header.id))
             .map_err(e)?;
-        let meta = Meta { header: header.clone(), counts: BTreeMap::new() };
-        let mut w = Writer { f, dir: dir.to_path_buf(), meta, status: HashMap::new() };
+        let meta = Meta {
+            header: header.clone(),
+            counts: BTreeMap::new(),
+            bytes: 0,
+            finished_ts: None,
+            outcome: None,
+            error: None,
+        };
+        let mut w = Writer { f, dir: dir.to_path_buf(), meta, status: HashMap::new(), sizes: HashMap::new() };
         w.write(&[Line::Run(header.clone())], true)?;
         Ok(w)
     }
@@ -151,6 +206,7 @@ impl Writer {
             dir: dir.to_path_buf(),
             meta: meta_of(run),
             status: run.entries.iter().map(|en| (en.n, en.status.clone())).collect(),
+            sizes: run.entries.iter().map(|en| (en.n, b64_len(&en.payload_b64))).collect(),
         })
     }
 
@@ -187,6 +243,9 @@ impl Writer {
     pub fn entries(&mut self, es: Vec<Entry>) -> R<()> {
         for en in &es {
             self.bump(en.n, Some(&en.status));
+            let size = b64_len(&en.payload_b64);
+            self.meta.bytes += size;
+            self.sizes.insert(en.n, size);
         }
         self.write(&es.into_iter().map(Line::Entry).collect::<Vec<_>>(), true)
     }
@@ -206,14 +265,30 @@ impl Writer {
     pub fn deleted(&mut self, ns: &[u32]) -> R<()> {
         for &n in ns {
             self.bump(n, None);
+            self.meta.bytes = self.meta.bytes.saturating_sub(self.sizes.remove(&n).unwrap_or(0));
         }
         self.write(&ns.iter().map(|&n| Line::Deleted { n }).collect::<Vec<_>>(), true)
+    }
+
+    /// Cierra el envío con su resultado. Sin fsync: si se pierde, el envío queda
+    /// como "no terminó", que es lo prudente.
+    pub fn finish(&mut self, outcome: &str, error: Option<String>, ts: u64) -> R<()> {
+        self.meta.finished_ts = Some(ts);
+        self.meta.outcome = Some(outcome.into());
+        self.meta.error = error.clone();
+        self.write(&[Line::End { ts, outcome: outcome.into(), error }], false)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.meta.header.id
     }
 }
 
 pub struct Run {
     pub header: Header,
     pub entries: Vec<Entry>,
+    /// (cuándo, resultado, error) si el envío llegó a cerrarse.
+    pub end: Option<(u64, String, Option<String>)>,
 }
 
 pub fn meta_of(run: &Run) -> Meta {
@@ -221,7 +296,18 @@ pub fn meta_of(run: &Run) -> Meta {
     for en in &run.entries {
         *counts.entry(en.status.clone()).or_default() += 1;
     }
-    Meta { header: run.header.clone(), counts }
+    let (finished_ts, outcome, error) = match &run.end {
+        Some((ts, o, err)) => (Some(*ts), Some(o.clone()), err.clone()),
+        None => (None, None, None),
+    };
+    Meta {
+        header: run.header.clone(),
+        counts,
+        bytes: run.entries.iter().map(|en| b64_len(&en.payload_b64)).sum(),
+        finished_ts,
+        outcome,
+        error,
+    }
 }
 
 /// Lee y pliega un archivo de ejecución.
@@ -229,6 +315,7 @@ pub fn read(file: &Path) -> R<Run> {
     let f = std::fs::File::open(file).map_err(e)?;
     let mut header = None;
     let mut entries: BTreeMap<u32, Entry> = BTreeMap::new();
+    let mut end = None;
     for (i, line) in std::io::BufReader::new(f).lines().enumerate() {
         let line = line.map_err(e)?;
         if line.trim().is_empty() {
@@ -251,11 +338,12 @@ pub fn read(file: &Path) -> R<Run> {
             Ok(Line::Deleted { n }) => {
                 entries.remove(&n);
             }
+            Ok(Line::End { ts, outcome, error }) => end = Some((ts, outcome, error)),
             Err(err) => log::warn!("{}: línea {} ilegible, se ignora ({err})", file.display(), i + 1),
         }
     }
     let header = header.ok_or_else(|| format!("{}: sin cabecera", file.display()))?;
-    Ok(Run { header, entries: entries.into_values().collect() })
+    Ok(Run { header, entries: entries.into_values().collect(), end })
 }
 
 pub fn read_run(dir: &Path, id: &str) -> R<Run> {
@@ -318,7 +406,7 @@ mod tests {
     fn folds_entries_status_and_deletes_and_survives_torn_tail() {
         let dir = std::env::temp_dir().join(format!("rabbit-tool-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let h = Header { id: "1700000000000-move".into(), ts: 1, op: "move".into(), source: "a".into(), target: Some("b".into()) };
+        let h = Header { id: "1700000000000-move".into(), ts: 1, op: "move".into(), source: "a".into(), target: Some("b".into()), ..Default::default() };
         let mut w = Writer::create(&dir, &h).unwrap();
         w.entries((0..3).map(entry).collect()).unwrap();
         w.status(vec![(0, "done", None), (1, "error", Some("x".into()))], None, true).unwrap();

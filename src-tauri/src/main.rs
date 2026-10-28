@@ -165,19 +165,43 @@ fn sync_io<T>(f: impl FnOnce() -> R<T>) -> R<T> {
     tokio::task::block_in_place(f)
 }
 
+/// Contexto que manda la UI para la metadata del respaldo.
+#[derive(Deserialize, Default, Clone)]
+struct RunCtx {
+    #[serde(default)]
+    profile: String,
+    /// Filtro local aplicado al elegir los mensajes.
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+/// Datos de un envío nuevo: de dónde sale y su versión padre (si viene de otro respaldo).
+struct RunInfo<'a> {
+    op: &'a str,
+    source: &'a str,
+    target: &'a Option<String>,
+    conn: &'a Conn,
+    ctx: &'a RunCtx,
+    origin: String,
+    parent: Option<String>,
+}
+
 /// Abre el archivo de respaldo de una ejecución nueva. Devuelve (writer, id).
-fn new_run(
-    app: &AppHandle,
-    op: &str,
-    source: &str,
-    target: &Option<String>,
-) -> R<(backup::Writer, String)> {
+fn new_run(app: &AppHandle, info: RunInfo) -> R<(backup::Writer, String)> {
     let header = backup::Header {
-        id: format!("{}-{op}", now_ms()),
+        id: format!("{}-{}", now_ms(), info.op),
         ts: now_ms(),
-        op: op.into(),
-        source: source.into(),
-        target: target.clone(),
+        op: info.op.into(),
+        source: info.source.into(),
+        target: info.target.clone(),
+        profile: info.ctx.profile.clone(),
+        host: info.conn.api.clone(),
+        vhost: info.conn.vhost.clone(),
+        user: info.conn.user.clone(),
+        app_version: app.package_info().version.to_string(),
+        parent: info.parent,
+        origin: Some(info.origin),
+        filter: info.ctx.filter.clone().filter(|f| !f.trim().is_empty()),
     };
     log::info!("respaldo nuevo: {}", header.id);
     let dir = backup_dir(app)?;
@@ -843,7 +867,9 @@ async fn drain(
     source: String,
     target: Option<String>,
     count: u32,
+    ctx: Option<RunCtx>,
 ) -> R<Value> {
+    let ctx = ctx.unwrap_or_default();
     begin(&state);
     let op = if target.is_some() { "move" } else { "ack" };
     log::info!("{op} \"{source}\" → {target:?} count={count} {}", conn.desc());
@@ -887,7 +913,18 @@ async fn drain(
                 break;
             }
             if run.is_none() {
-                run = Some(new_run(&app, op, &source, &target)?);
+                run = Some(new_run(
+                    &app,
+                    RunInfo {
+                        op,
+                        source: &source,
+                        target: &target,
+                        conn: &conn,
+                        ctx: &ctx,
+                        origin: format!("queue:{source}"),
+                        parent: None,
+                    },
+                )?);
             }
             let (w, _) = run.as_mut().unwrap();
             let refs: Vec<&Delivery> = ds.iter().collect();
@@ -919,6 +956,9 @@ async fn drain(
         started.elapsed(),
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
     );
+    if let Some((w, _)) = run.as_mut() {
+        close_run(w, &result, was_cancelled, stalled, !failed.is_empty());
+    }
     result?;
     Ok(json!({
         "ok": ok,
@@ -928,6 +968,20 @@ async fn drain(
         "stalled": stalled,
         "backup": run.map(|(_, id)| id),
     }))
+}
+
+/// Cierra un respaldo con su resultado (best-effort: el envío ya terminó).
+fn close_run(w: &mut backup::Writer, result: &R<()>, cancelled: bool, stalled: bool, partial: bool) {
+    let (outcome, error) = match result {
+        Err(err) => ("error", Some(err.clone())),
+        Ok(()) if cancelled => ("cancelled", None),
+        Ok(()) if partial => ("partial", None),
+        Ok(()) if stalled => ("stalled", None),
+        Ok(()) => ("ok", None),
+    };
+    if let Err(err) = sync_io(|| w.finish(outcome, error, now_ms())) {
+        log::warn!("no se pudo cerrar el respaldo {}: {err}", w.id());
+    }
 }
 
 /// Mueve (o ackea, sin `target`) solo los mensajes elegidos en la UI. Recorre la
@@ -943,7 +997,9 @@ async fn move_selected(
     target: Option<String>,
     fps: Vec<String>,
     scan: u32,
+    ctx: Option<RunCtx>,
 ) -> R<Value> {
+    let ctx = ctx.unwrap_or_default();
     begin(&state);
     let op = if target.is_some() { "move" } else { "ack" };
     let wanted = fps.len() as u32;
@@ -972,7 +1028,7 @@ async fn move_selected(
     }
     let mut left = wanted;
     let (mut moved, mut failed) = (Vec::<String>::new(), Vec::<String>::new());
-    let mut backup_id = None;
+    let mut run: Option<(backup::Writer, String)> = None;
     progress(&app, op, 0, wanted);
 
     let result: R<()> = async {
@@ -1008,8 +1064,18 @@ async fn move_selected(
         if picked.is_empty() {
             return Ok(());
         }
-        let (mut w, id) = new_run(&app, op, &source, &target)?;
-        backup_id = Some(id);
+        let (w, _) = run.insert(new_run(
+            &app,
+            RunInfo {
+                op,
+                source: &source,
+                target: &target,
+                conn: &conn,
+                ctx: &ctx,
+                origin: format!("queue:{source}"),
+                parent: None,
+            },
+        )?);
         for (i, group) in picked.chunks(CHUNK).enumerate() {
             // Entre lotes: lo ya procesado queda hecho; el resto vuelve a la cola.
             if cancelled(&state) {
@@ -1017,7 +1083,7 @@ async fn move_selected(
             }
             let refs: Vec<&Delivery> = group.iter().collect();
             let base = i * CHUNK;
-            let errs = process_group(&ch, &mut w, base as u32, &refs, &target, true).await?;
+            let errs = process_group(&ch, w, base as u32, &refs, &target, true).await?;
             for (j, err) in errs.into_iter().enumerate() {
                 match err {
                     None => moved.push(picked_fp[base + j].clone()),
@@ -1039,6 +1105,9 @@ async fn move_selected(
         failed.len(),
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
     );
+    if let Some((w, _)) = run.as_mut() {
+        close_run(w, &result, was_cancelled, false, !failed.is_empty() || (!was_cancelled && left > 0));
+    }
     result?;
     Ok(json!({
         "ok": moved.len(),
@@ -1047,8 +1116,36 @@ async fn move_selected(
         "moved": moved,
         "failed": failed,
         "cancelled": was_cancelled,
-        "backup": backup_id,
+        "backup": run.map(|(_, id)| id),
     }))
+}
+
+/// Publica un grupo en `queue` dejando constancia en el respaldo: entradas
+/// "pending" con fsync antes de publicar y "done"/"error" según el confirm.
+/// Para envíos sin cola de origen (archivo, re-publicar): "pending" = no se sabe si
+/// llegó (se cortó entre ambos pasos).
+async fn publish_logged(
+    ch: &Channel,
+    w: &mut backup::Writer,
+    queue: &str,
+    entries: Vec<backup::Entry>,
+    datas: &[Vec<u8>],
+) -> R<Vec<Option<String>>> {
+    let ns: Vec<u32> = entries.iter().map(|en| en.n).collect();
+    let props: Vec<BasicProperties> = entries.iter().map(|en| en.properties.clone()).collect();
+    sync_io(|| w.entries(entries))?;
+    let msgs = datas.iter().zip(props).map(|(d, p)| (&d[..], p)).collect();
+    let errs = publish_all(ch, queue, msgs).await;
+    let upd = ns
+        .iter()
+        .zip(&errs)
+        .map(|(&n, err)| match err {
+            None => (n, "done", None),
+            Some(msg) => (n, "error", Some(msg.clone())),
+        })
+        .collect();
+    sync_io(|| w.status(upd, None, true))?;
+    Ok(errs)
 }
 
 #[derive(Deserialize)]
@@ -1058,7 +1155,8 @@ struct PubMsg {
     properties: Value,
 }
 
-/// Publica en `queue` mensajes cargados desde un archivo JSON, con confirms.
+/// Publica en `queue` mensajes cargados desde un archivo JSON, con confirms. Lo
+/// enviado queda en un respaldo nuevo (op "publish", origen el archivo).
 #[tauri::command]
 async fn publish_messages(
     app: AppHandle,
@@ -1066,46 +1164,80 @@ async fn publish_messages(
     conn: Conn,
     queue: String,
     messages: Vec<PubMsg>,
+    file: Option<String>,
+    ctx: Option<RunCtx>,
 ) -> R<Value> {
+    let ctx = ctx.unwrap_or_default();
     begin(&state);
     let total = messages.len() as u32;
-    log::info!("publish_messages → \"{queue}\": {total} mensajes {}", conn.desc());
+    let file = file.unwrap_or_else(|| "archivo".into());
+    log::info!("publish_messages {file} → \"{queue}\": {total} mensajes {}", conn.desc());
     ready_count(&conn, &state, &queue).await?;
     let ch = channel(&state, &conn).await?;
     ch.confirm_select(ConfirmSelectOptions::default()).await.map_err(e)?;
     let (mut ok, mut failed) = (0u32, Vec::<String>::new());
     // Índices publicados con confirmación: la UI los marca para no re-enviarlos.
     let mut published: Vec<u32> = Vec::new();
+    let target = Some(queue.clone());
+    let (mut w, backup_id) = new_run(
+        &app,
+        RunInfo {
+            op: "publish",
+            source: &file,
+            target: &target,
+            conn: &conn,
+            ctx: &ctx,
+            origin: format!("file:{file}"),
+            parent: None,
+        },
+    )?;
     progress(&app, "publish", 0, total);
-    for (gi, group) in messages.chunks(500).enumerate() {
-        if cancelled(&state) {
-            break;
-        }
-        let msgs = group
-            .iter()
-            .map(|m| (m.payload.as_bytes(), props_from_json(&m.properties)))
-            .collect();
-        for (j, err) in publish_all(&ch, &queue, msgs).await.into_iter().enumerate() {
-            match err {
-                None => {
-                    ok += 1;
-                    published.push((gi * 500 + j) as u32);
+    let result: R<()> = async {
+        for (gi, group) in messages.chunks(500).enumerate() {
+            if cancelled(&state) {
+                break;
+            }
+            let datas: Vec<Vec<u8>> = group.iter().map(|m| m.payload.clone().into_bytes()).collect();
+            let entries = group
+                .iter()
+                .enumerate()
+                .map(|(j, m)| backup::Entry {
+                    n: (gi * 500 + j) as u32,
+                    status: "pending".into(),
+                    error: None,
+                    routing_key: queue.clone(),
+                    exchange: String::new(),
+                    properties: props_from_json(&m.properties),
+                    payload_b64: B64.encode(m.payload.as_bytes()),
+                    republished_to: None,
+                })
+                .collect();
+            for (j, err) in publish_logged(&ch, &mut w, &queue, entries, &datas).await?.into_iter().enumerate() {
+                match err {
+                    None => {
+                        ok += 1;
+                        published.push((gi * 500 + j) as u32);
+                    }
+                    Some(msg) => failed.push(msg),
                 }
-                Some(msg) => failed.push(msg),
+            }
+            progress(&app, "publish", ok, total);
+            if !failed.is_empty() {
+                break;
             }
         }
-        progress(&app, "publish", ok, total);
-        if !failed.is_empty() {
-            break;
-        }
+        Ok(())
     }
+    .await;
     let _ = ch.close(200, "ok").await;
     let was_cancelled = cancelled(&state);
+    close_run(&mut w, &result, was_cancelled, false, !failed.is_empty());
     log::info!(
         "publish_messages → \"{queue}\": {ok}/{total} ok, {} fallidos, cancelado={was_cancelled}",
         failed.len()
     );
-    Ok(json!({ "ok": ok, "total": total, "failed": failed, "published": published, "cancelled": was_cancelled }))
+    result?;
+    Ok(json!({ "ok": ok, "total": total, "failed": failed, "published": published, "cancelled": was_cancelled, "backup": backup_id }))
 }
 
 #[tauri::command]
@@ -1120,6 +1252,9 @@ fn meta_json(m: &backup::Meta) -> Value {
         "count": m.total(), "done": m.count("done"), "error": m.count("error"),
         "pending": m.count("pending"), "published": m.count("published"),
         "republished": m.count("republished"),
+        "bytes": m.bytes, "finished_ts": m.finished_ts, "outcome": m.outcome, "end_error": m.error,
+        "profile": h.profile, "host": h.host, "vhost": h.vhost, "user": h.user,
+        "app_version": h.app_version, "parent": h.parent, "origin": h.origin, "filter": h.filter,
     })
 }
 
@@ -1170,7 +1305,7 @@ async fn load_backup(app: AppHandle, id: Option<String>) -> R<Value> {
                 })
             })
             .collect();
-        Ok(json!({ "id": id, "entries": entries }))
+        Ok(json!({ "id": id, "meta": meta_json(&backup::meta_of(&run)), "entries": entries }))
     })
     .await
 }
@@ -1191,6 +1326,9 @@ fn group_refs(items: Vec<EntryRef>) -> R<std::collections::BTreeMap<String, Vec<
 }
 
 /// Re-publica entradas de un respaldo a una cola, con sus properties originales.
+/// Es una versión nueva: lo enviado queda en un respaldo propio (op "republish",
+/// `parent` = el respaldo de origen). En el original se marca "republished" para
+/// avisar de duplicados si se vuelve a enviar.
 #[tauri::command]
 async fn republish(
     app: AppHandle,
@@ -1198,7 +1336,9 @@ async fn republish(
     conn: Conn,
     items: Vec<EntryRef>,
     queue: String,
+    ctx: Option<RunCtx>,
 ) -> R<Value> {
+    let ctx = ctx.unwrap_or_default();
     begin(&state);
     let dir = backup_dir(&app)?;
     let by_run = group_refs(items)?;
@@ -1209,11 +1349,29 @@ async fn republish(
     let total = by_run.values().map(Vec::len).sum::<usize>() as u32;
     let mut done = 0u32;
     log::info!("republish → \"{queue}\": {total} entradas");
+    let mut version: Option<(backup::Writer, String)> = None;
     let result: R<()> = async {
+        let mut next_n = 0u32;
         for (id, ns) in by_run {
             let (d2, id2) = (dir.clone(), id.clone());
             let run = blocking(move || backup::read_run(&d2, &id2)).await?;
-            let mut w = sync_io(|| backup::Writer::open(&dir, &run))?;
+            let mut orig = sync_io(|| backup::Writer::open(&dir, &run))?;
+            if version.is_none() {
+                let target = Some(queue.clone());
+                version = Some(new_run(
+                    &app,
+                    RunInfo {
+                        op: "republish",
+                        source: &run.header.source,
+                        target: &target,
+                        conn: &conn,
+                        ctx: &ctx,
+                        origin: format!("backup:{id}"),
+                        parent: Some(id.clone()),
+                    },
+                )?);
+            }
+            let (w, _) = version.as_mut().unwrap();
             let wanted: std::collections::HashSet<u32> = ns.into_iter().collect();
             let chosen: Vec<&backup::Entry> = run.entries.iter().filter(|en| wanted.contains(&en.n)).collect();
             for group in chosen.chunks(500) {
@@ -1224,12 +1382,19 @@ async fn republish(
                     .iter()
                     .map(|en| B64.decode(&en.payload_b64).map_err(e))
                     .collect::<R<_>>()?;
-                let msgs = group
+                let copies: Vec<backup::Entry> = group
                     .iter()
-                    .zip(&datas)
-                    .map(|(en, d)| (&d[..], en.properties.clone()))
+                    .enumerate()
+                    .map(|(j, en)| backup::Entry {
+                        n: next_n + j as u32,
+                        status: "pending".into(),
+                        error: None,
+                        republished_to: None,
+                        ..(*en).clone()
+                    })
                     .collect();
-                let errs = publish_all(&ch, &queue, msgs).await;
+                next_n += group.len() as u32;
+                let errs = publish_logged(&ch, w, &queue, copies, &datas).await?;
                 let first_err = errs.iter().flatten().next().cloned();
                 let upd: Vec<_> = group
                     .iter()
@@ -1238,7 +1403,7 @@ async fn republish(
                     .map(|(en, _)| (en.n, "republished", None))
                     .collect();
                 done += upd.len() as u32;
-                sync_io(|| w.status(upd, Some(&queue), true))?;
+                sync_io(|| orig.status(upd, Some(&queue), true))?;
                 progress(&app, "republish", done, total);
                 if let Some(err) = first_err {
                     return Err(err);
@@ -1250,12 +1415,15 @@ async fn republish(
     .await;
     let _ = ch.close(200, "ok").await;
     let was_cancelled = cancelled(&state);
+    if let Some((w, _)) = version.as_mut() {
+        close_run(w, &result, was_cancelled, false, false);
+    }
     log::info!(
         "republish → \"{queue}\": {done}/{total}, cancelado={was_cancelled}{}",
         result.as_ref().err().map(|x| format!(", error: {x}")).unwrap_or_default()
     );
     result?;
-    Ok(json!({ "ok": done, "total": total, "cancelled": was_cancelled }))
+    Ok(json!({ "ok": done, "total": total, "cancelled": was_cancelled, "backup": version.map(|(_, id)| id) }))
 }
 
 /// Borra entradas de respaldos; si un respaldo queda vacío se borra completo.
@@ -1429,6 +1597,36 @@ fn log_path(app: AppHandle) -> R<String> {
     Ok(log_file(&app)?.display().to_string())
 }
 
+const REPO_URL: &str = "https://github.com/Dyool-distelsa/rabbit-tool";
+
+/// Versión y datos de compilación para "Acerca de".
+#[tauri::command]
+fn app_info(app: AppHandle) -> Value {
+    json!({
+        "version": app.package_info().version.to_string(),
+        "commit": env!("BUILD_COMMIT"),
+        "date": env!("BUILD_DATE"),
+        "repo": REPO_URL,
+    })
+}
+
+/// Abre en el navegador un enlace de la ayuda. Solo del repositorio de la app:
+/// nunca una URL arbitraria que venga de la UI.
+#[tauri::command]
+fn open_url(url: String) -> R<()> {
+    if !url.starts_with(REPO_URL) || url.contains(['"', ' ', '&', '|', '^']) {
+        log::warn!("open_url rechazada: {url}");
+        return Err("enlace no permitido".into());
+    }
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", &url]).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(&url).spawn();
+    r.map(|_| ()).map_err(e)
+}
+
 /// Abre el explorador con el archivo de log seleccionado.
 #[tauri::command]
 fn reveal_log(app: AppHandle) -> R<()> {
@@ -1501,7 +1699,9 @@ fn main() {
             disconnect,
             log_ui,
             log_path,
-            reveal_log
+            reveal_log,
+            app_info,
+            open_url
         ])
         .run(tauri::generate_context!())
         .expect("error al iniciar tauri");

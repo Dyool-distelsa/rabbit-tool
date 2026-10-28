@@ -1,8 +1,9 @@
 import { mountToastContainer } from './toast.js';
 import { createVirtualList } from './vlist.js';
 import { renderJson } from './highlight.js';
-import { mountBunnies, setBunnyMode, bunnyDash, bunny, terrorScene, terrorLevel, TERROR_TEXT } from './bunny.js';
+import { mountBunnies, setBunnyMode, bunnyDash, bunny, eagle, terrorScene, terrorLevel, TERROR_TEXT } from './bunny.js';
 import { worstEnv, ENV_INFO } from './env.js';
+import { renderHelp } from './help.js';
 
 mountBunnies();
 
@@ -373,16 +374,26 @@ async function loadQueues({ page = S.qq.page, silent = false } = {}) {
   }
 }
 
-/** Conejo escarbando en el sidebar mientras se buscan colas. */
+/**
+ * Mientras se buscan colas un águila sobrevuela y el conejo corre en círculos para
+ * esquivarla. Si la carga se demora, el texto lo avisa.
+ */
+const IMPATIENT_MS = 2500;
+let impatientTimer = 0;
+$('qdigEagle').innerHTML = eagle(56);
 function showDig(on) {
   $('qdig').hidden = !on;
+  clearTimeout(impatientTimer);
   if (on) {
     $('qempty').hidden = true;
     $('pager').hidden = true;
     $('queues').classList.remove('anim');
     $('queues').replaceChildren();
     const f = $('qfilter').value.trim();
-    $('qdigText').textContent = f ? `Escarbando colas con “${f}”…` : 'Escarbando colas…';
+    $('qdigText').textContent = f ? `Buscando colas con “${f}”…` : 'Buscando colas…';
+    impatientTimer = setTimeout(() => {
+      $('qdigText').textContent = 'Se está tardando… (el broker responde lento)';
+    }, IMPATIENT_MS);
   }
 }
 
@@ -603,7 +614,7 @@ function applyFilter({ keepScroll = false } = {}) {
           ? 'Cargá las colas y elegí una'
           : !S.current
             ? 'Elegí una cola de la izquierda'
-            : `Tocá "Ver (nack)" para leer hasta ${fmt(count())} mensajes`;
+            : `Tocá "Ver (nack)" para leer la primera página (${fmt(pageSize())} mensajes)`;
   $('emptyText').textContent = src.length && !S.view.length ? 'Ningún mensaje coincide con el filtro' : emptyText;
   $('empty').hidden = S.view.length > 0;
   renderDetail();
@@ -965,6 +976,9 @@ function ask({ title, body, ok = 'Aceptar', danger = false, queue = null, env = 
   });
 }
 
+/** Contexto para la metadata del respaldo: perfil y filtro local aplicado. */
+const runCtx = () => ({ profile: profile()?.name ?? '', filter: $('filter').value.trim() || null });
+
 // --- acciones de cola ---------------------------------------------------------------
 // Sin tope: para ack/mover N puede ser 200k o más (se procesa en lotes).
 const count = () => Math.max(1, parseInt($('count').value, 10) || 1);
@@ -1092,7 +1106,7 @@ async function drain(target) {
   startOp(target ? `Moviendo ${source} → ${target}` : `Ackeando ${source}`, n, { cancellable: true, mode: 'run' });
   showSkeleton(true, target ? `Moviendo mensajes a ${target}…` : `Sacando mensajes de ${source}…`);
   try {
-    const r = await atLeast(call('drain', { conn: conn(), source, target: target || null, count: n }), MIN_ANIM_MS);
+    const r = await atLeast(call('drain', { conn: conn(), source, target: target || null, count: n, ctx: runCtx() }), MIN_ANIM_MS);
     const verb = target ? 'movidos' : 'ackeados';
     if (r.total === 0) toast.info(`“${source}” no tiene mensajes ready`);
     else if (r.failed.length) toast.err(`${fmt(r.ok)} ${verb}, falló: ${r.failed[0]}. Los fallidos siguen en origen.`);
@@ -1146,7 +1160,7 @@ async function drainSelected(target) {
   showSkeleton(true, target ? `Moviendo seleccionados a ${target}…` : `Sacando seleccionados de ${source}…`);
   try {
     const r = await atLeast(
-      call('move_selected', { conn: conn(), source, target: target || null, fps, scan }),
+      call('move_selected', { conn: conn(), source, target: target || null, fps, scan, ctx: runCtx() }),
       MIN_ANIM_MS
     );
     const verb = target ? 'movidos' : 'ackeados';
@@ -1253,7 +1267,7 @@ $('publishFile').onclick = async () => {
   startOp(`Publicando en ${queue}`, send.length, { mode: 'hop', cancellable: true });
   try {
     const r = await atLeast(
-      call('publish_messages', { conn: conn(), queue, messages: send.map((it) => ({ payload: it.payload, properties: it.properties })) }),
+      call('publish_messages', { conn: conn(), queue, file: S.fileName, ctx: runCtx(), messages: send.map((it) => ({ payload: it.payload, properties: it.properties })) }),
       MIN_ANIM_MS
     );
     for (const i of r.published) send[i].sentTo = queue;
@@ -1272,33 +1286,60 @@ $('publishFile').onclick = async () => {
   }
   applyFilter({ keepScroll: true });
   refreshExact([queue]);
+  // Lo publicado desde el archivo quedó en un respaldo nuevo.
+  showLatestBackup();
 };
 
-// --- respaldo local (uno por envío; la pestaña muestra el último) ---------------------
-const bkpLabel = (b) =>
-  `${relTime(b.ts)} · ${b.op === 'move' ? 'mover' : 'ack'} · ${b.source}${b.target ? ` → ${b.target}` : ''} · ${fmt(b.count)} msgs` +
-  ((b.pending || 0) + (b.published || 0) ? ` · ⚠ ${fmt((b.pending || 0) + (b.published || 0))} sin resolver` : '');
+// --- respaldos (uno por envío, versionados) -------------------------------------------
+const OP_LABEL = { move: 'mover', ack: 'ack', publish: 'publicar', republish: 're-publicar' };
+const OUTCOME_LABEL = { ok: 'completo', partial: 'parcial', cancelled: 'cancelado', stalled: 'detenido', error: 'error' };
+const unresolvedOf = (b) => (b.pending || 0) + (b.published || 0);
 
-/** Lista de respaldos para el selector; el badge muestra el tamaño del último. */
+const bkpLabel = (b) =>
+  `${relTime(b.ts)} · ${OP_LABEL[b.op] ?? b.op} · ${b.source}${b.target ? ` → ${b.target}` : ''} · ${fmt(b.count)} msgs` +
+  (unresolvedOf(b) ? ` · ⚠ ${fmt(unresolvedOf(b))} sin resolver` : '');
+
+/** "file:x.json" → "archivo x.json"; "backup:<id>" → "respaldo <fecha>"; "queue:q" → "cola q". */
+function originLabel(origin) {
+  if (!origin) return '';
+  const [kind, ...rest] = origin.split(':');
+  const value = rest.join(':');
+  if (kind === 'file') return `archivo ${value}`;
+  if (kind === 'queue') return `cola ${value}`;
+  if (kind === 'backup') {
+    const p = S.backups?.find((b) => b.id === value);
+    return `respaldo ${p ? relTime(p.ts) : value}`;
+  }
+  return origin;
+}
+
+const duration = (b) => {
+  if (!b.finished_ts) return '';
+  const s = Math.max(0, Math.round((b.finished_ts - b.ts) / 1000));
+  return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
+};
+
+/** Lista de respaldos (solo resúmenes); el badge muestra el tamaño del último. */
 async function loadBackups() {
   const runs = await call('list_backups', undefined, { quiet: true });
   S.backups = runs;
   if (!runs.some((b) => b.id === S.backupId)) S.backupId = runs[0]?.id ?? null;
-  const sel = $('bkpSelect');
-  sel.replaceChildren(...runs.map((b, i) => new Option(`${i === 0 ? 'Último · ' : ''}${bkpLabel(b)}`, b.id)));
-  if (!runs.length) sel.appendChild(new Option('Sin respaldos todavía', ''));
-  sel.value = S.backupId ?? '';
+  $('bkpBrowse').textContent = runs.length ? `Respaldos guardados (${fmt(runs.length)})…` : 'Sin respaldos todavía';
+  $('bkpBrowse').disabled = !runs.length;
   $('localCount').textContent = runs[0]?.count ? fmt(runs[0].count) : '';
+  if ($('bkpDialog').open) renderBkpList();
 }
 
 async function loadLocal() {
   showSkeleton(!S.localItems.length, 'Leyendo respaldo…');
   try {
     await loadBackups();
-    const r = S.backupId ? await call('load_backup', { id: S.backupId }) : { entries: [] };
+    const r = S.backupId ? await call('load_backup', { id: S.backupId }) : { entries: [], meta: null };
+    S.backupMeta = r.meta;
     S.localItems = r.entries.map(normLocal);
     const keys = new Set(S.localItems.map((it) => it.key));
     for (const k of S.picks.local) if (!keys.has(k)) S.picks.local.delete(k);
+    renderBkpMeta();
     if (S.tab === 'local') applyFilter({ keepScroll: true });
   } catch (err) {
     toast.err(`No se pudo leer el respaldo: ${err}`);
@@ -1307,6 +1348,164 @@ async function loadLocal() {
   }
 }
 
+function openBackup(id) {
+  S.backupId = id;
+  S.picks.local.clear();
+  S.localItems = [];
+  if (S.tab !== 'local') setTab('local');
+  else loadLocal();
+}
+
+/** Metadata del respaldo abierto: qué fue, cuándo, dónde, cómo terminó y su linaje. */
+function renderBkpMeta() {
+  const box = $('bkpMeta');
+  const m = S.backupMeta;
+  box.hidden = S.tab !== 'local' || !m;
+  if (!m) return;
+  const chip = (text, cls = '') => {
+    const c = document.createElement('span');
+    c.className = `chip ${cls}`;
+    c.textContent = text;
+    return c;
+  };
+  const text = (label, value) => {
+    const s = document.createElement('span');
+    s.append(`${label} `);
+    const b = document.createElement('b');
+    b.textContent = value;
+    s.appendChild(b);
+    return s;
+  };
+  const sep = () => Object.assign(document.createElement('span'), { className: 'sep' });
+  const link = (label, onClick) => {
+    const a = document.createElement('button');
+    a.type = 'button';
+    a.className = 'link';
+    a.textContent = label;
+    a.onclick = onClick;
+    return a;
+  };
+
+  const parts = [chip(OP_LABEL[m.op] ?? m.op, 'chip--op')];
+  const outcome = m.outcome ?? 'running';
+  parts.push(chip(m.outcome ? OUTCOME_LABEL[m.outcome] ?? m.outcome : 'no terminó (se cortó)', `chip--${outcome}`));
+  parts.push(text('', `${m.source}${m.target ? ` → ${m.target}` : ''}`));
+  parts.push(sep(), text('', relTime(m.ts)));
+  if (duration(m)) parts.push(text('duró', duration(m)));
+  parts.push(sep(), text('', `${fmt(m.count)} msgs · ${fmtSize(m.bytes || 0)}`));
+  for (const st of ['done', 'published', 'pending', 'error', 'republished']) if (m[st]) parts.push(chip(`${st} ${fmt(m[st])}`, `chip--${st}`));
+  if (m.profile || m.host) {
+    parts.push(sep(), text('perfil', `${m.profile || '—'}`));
+    parts.push(text('', `${m.user ? m.user + '@' : ''}${(m.host || '').replace(/^https?:\/\//, '')} · vhost ${m.vhost || '/'}`));
+  }
+  if (m.origin) parts.push(sep(), text('origen', originLabel(m.origin)));
+  if (m.filter) parts.push(text('filtro', `“${m.filter}”`));
+  if (m.parent) {
+    const p = S.backups?.find((b) => b.id === m.parent);
+    parts.push(sep(), document.createTextNode('versión de '), p ? link(bkpLabel(p), () => openBackup(p.id)) : text('', `${m.parent} (ya no está)`));
+  }
+  const children = (S.backups ?? []).filter((b) => b.parent === m.id);
+  if (children.length) {
+    parts.push(sep(), document.createTextNode(`${children.length} ${children.length === 1 ? 'versión nueva' : 'versiones nuevas'}: `));
+    children.forEach((c, i) => {
+      if (i) parts.push(document.createTextNode(', '));
+      parts.push(link(relTime(c.ts), () => openBackup(c.id)));
+    });
+  }
+  if (m.end_error) parts.push(sep(), chip(`error: ${m.end_error}`, 'chip--error'));
+  if (m.app_version) parts.push(sep(), text('app', m.app_version));
+  box.replaceChildren(...parts);
+}
+
+/** Explorador: todos los respaldos guardados con su metadata; las versiones debajo de su original. */
+function renderBkpList() {
+  const q = $('bkpFilter').value.trim().toLowerCase();
+  const runs = S.backups ?? [];
+  const hay = (b) =>
+    [b.op, OP_LABEL[b.op], b.source, b.target, b.profile, b.host, b.vhost, b.user, b.origin, b.filter, OUTCOME_LABEL[b.outcome]]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+  const shown = runs.filter((b) => !q || hay(b).includes(q));
+  // Raíces primero (más recientes arriba) y cada versión debajo de su original.
+  const ids = new Set(shown.map((b) => b.id));
+  const roots = shown.filter((b) => !b.parent || !ids.has(b.parent));
+  const ordered = [];
+  const walk = (b, depth) => {
+    ordered.push([b, depth]);
+    shown.filter((c) => c.parent === b.id).forEach((c) => walk(c, depth + 1));
+  };
+  roots.forEach((b) => walk(b, 0));
+
+  const frag = document.createDocumentFragment();
+  for (const [b, depth] of ordered) {
+    const item = document.createElement('div');
+    item.className = `bkp-item${b.id === S.backupId ? ' current' : ''}${depth ? ' child' : ''}`;
+    item.style.marginLeft = depth ? `${depth * 24}px` : '';
+    const title = document.createElement('div');
+    title.className = 'bkp-item__title';
+    const op = document.createElement('span');
+    op.className = 'chip chip--op';
+    op.textContent = OP_LABEL[b.op] ?? b.op;
+    const what = document.createElement('span');
+    what.textContent = `${b.source}${b.target ? ` → ${b.target}` : ''}`;
+    title.append(op, what);
+    if (b.outcome && b.outcome !== 'ok') {
+      const o = document.createElement('span');
+      o.className = `chip chip--${b.outcome}`;
+      o.textContent = OUTCOME_LABEL[b.outcome] ?? b.outcome;
+      title.appendChild(o);
+    } else if (!b.outcome) {
+      const o = document.createElement('span');
+      o.className = 'chip chip--running';
+      o.textContent = 'no terminó';
+      title.appendChild(o);
+    }
+    if (unresolvedOf(b)) {
+      const u = document.createElement('span');
+      u.className = 'chip chip--published';
+      u.textContent = `⚠ ${fmt(unresolvedOf(b))} sin resolver`;
+      title.appendChild(u);
+    }
+    const right = document.createElement('div');
+    right.className = 'bkp-item__right';
+    right.textContent = `${relTime(b.ts)}${duration(b) ? ` · ${duration(b)}` : ''}`;
+    const sub = document.createElement('div');
+    sub.className = 'bkp-item__sub';
+    const bits = [
+      `${fmt(b.count)} msgs · ${fmtSize(b.bytes || 0)}`,
+      b.profile ? `perfil ${b.profile}` : '',
+      b.host ? `${(b.host || '').replace(/^https?:\/\//, '')} · vhost ${b.vhost || '/'}` : '',
+      b.origin ? `origen: ${originLabel(b.origin)}` : '',
+      b.filter ? `filtro “${b.filter}”` : '',
+      depth ? 'versión nueva' : '',
+    ].filter(Boolean);
+    for (const t of bits) sub.appendChild(Object.assign(document.createElement('span'), { textContent: t }));
+    item.append(title, right, sub);
+    item.onclick = () => {
+      $('bkpDialog').close();
+      openBackup(b.id);
+    };
+    frag.appendChild(item);
+  }
+  if (!ordered.length) {
+    const empty = document.createElement('p');
+    empty.className = 'help-text help-text--dim';
+    empty.textContent = runs.length ? 'Ningún respaldo coincide con la búsqueda.' : 'Todavía no hay respaldos.';
+    frag.appendChild(empty);
+  }
+  $('bkpList').replaceChildren(frag);
+}
+
+$('bkpBrowse').onclick = async () => {
+  await loadBackups().catch(() => {});
+  $('bkpFilter').value = '';
+  renderBkpList();
+  $('bkpDialog').showModal();
+  $('bkpFilter').focus();
+};
+$('bkpFilter').addEventListener('input', renderBkpList);
+
 /** Tras un envío nuevo, la pestaña vuelve a mostrar el último respaldo. */
 function showLatestBackup() {
   S.backupId = null;
@@ -1314,13 +1513,6 @@ function showLatestBackup() {
   if (S.tab === 'local') loadLocal();
   else loadBackups().catch(() => {});
 }
-
-$('bkpSelect').onchange = () => {
-  S.backupId = $('bkpSelect').value || null;
-  S.picks.local.clear();
-  S.localItems = [];
-  loadLocal();
-};
 
 const refsOf = (items) => items.map((it) => ({ batch: it.batch, n: it.n }));
 
@@ -1361,10 +1553,10 @@ $('republishSel').onclick = async () => {
   }
   startOp(`Re-publicando en ${queue}`, send.length, { mode: 'hop', cancellable: true });
   try {
-    const r = await atLeast(call('republish', { conn: conn(), items: refsOf(send), queue }), MIN_ANIM_MS);
+    const r = await atLeast(call('republish', { conn: conn(), items: refsOf(send), queue, ctx: runCtx() }), MIN_ANIM_MS);
     if (r.cancelled) toast.info(`Cancelado: ${fmt(r.ok)} de ${fmt(r.total)} re-publicados en ${queue}`);
     else {
-      toast.ok(`${fmt(r.ok)} mensajes re-publicados en ${queue}`);
+      toast.ok(`${fmt(r.ok)} mensajes re-publicados en ${queue} · se guardó como versión nueva del respaldo`);
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} re-publicados en ${queue}`);
@@ -1374,7 +1566,8 @@ $('republishSel').onclick = async () => {
   } finally {
     endOp();
   }
-  loadLocal();
+  // Re-publicar creó una versión nueva del respaldo: se abre esa.
+  showLatestBackup();
   refreshExact([queue]);
 };
 
@@ -1421,6 +1614,7 @@ function setTab(t) {
   $('fileActions').hidden = t !== 'file';
   $('localActions').hidden = t !== 'local';
   applyFilter();
+  renderBkpMeta();
   if (t === 'local') loadLocal();
 }
 for (const b of document.querySelectorAll('.tab')) b.onclick = () => setTab(b.dataset.tab);
@@ -1540,10 +1734,14 @@ $('autoRefresh').onchange = setAuto;
 setAuto();
 
 call('backup_path', undefined, { quiet: true }).then((p) => {
+  paths.backup = p;
   $('backupPath').textContent = `Respaldo: ${p}`;
   $('backupPath').onclick = () => navigator.clipboard.writeText(p).then(() => toast.ok('Ruta copiada'));
 });
-call('log_path', undefined, { quiet: true }).then((p) => ($('openLog').title = `Abrir carpeta del log: ${p}`));
+call('log_path', undefined, { quiet: true }).then((p) => {
+  paths.log = p;
+  $('openLog').title = `Abrir carpeta del log: ${p}`;
+});
 $('openLog').onclick = () => call('reveal_log', undefined, { quiet: true }).catch((err) => toast.err(`No se pudo abrir el log: ${err}`));
 
 // --- retención y borrado de respaldos --------------------------------------------
@@ -1613,6 +1811,79 @@ $('deleteRun').onclick = async () => {
     for (let i = 0; i < 50 && S.op; i++) await new Promise((r) => setTimeout(r, 200));
     await win.destroy();
   });
+}
+
+// --- ayuda --------------------------------------------------------------------------
+const paths = {};
+async function openHelp() {
+  if ($('helpDialog').open) return;
+  await renderHelp($('helpBody'), {
+    invoke: (cmd, args) => call(cmd, args, { quiet: true }),
+    notify: (msg, kind = 'info') => showToast(msg, kind),
+    paths,
+  });
+  $('helpDialog').showModal();
+  $('helpBody').scrollTop = 0;
+}
+$('help').onclick = openHelp;
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'F1') {
+    ev.preventDefault();
+    openHelp();
+  }
+});
+
+// --- el conejo se duerme si no hay actividad ------------------------------------------
+// Solo los conejos en reposo (sit): los que saltan/corren/escarban indican trabajo.
+// Secuencia: cava su madriguera, se acuesta al lado y se duerme.
+{
+  const IDLE_MS = 30_000; // inactividad hasta que empieza a cavar
+  const DIG_MS = 15_000; // cuánto cava antes de meterse a dormir
+  let timer = 0;
+  let digTimer = 0;
+  let state = 'awake'; // awake | digging | asleep
+  let lastArm = 0;
+  const resting = () => document.querySelectorAll('.bunny--sit');
+  const sleep = () => {
+    if (S.op) return arm(); // con una operación en curso nadie duerme
+    state = 'digging';
+    for (const b of resting()) b.classList.add('bunny--dig');
+    digTimer = setTimeout(() => {
+      state = 'asleep';
+      for (const b of document.querySelectorAll('.bunny--dig.bunny--sit')) {
+        b.classList.remove('bunny--dig');
+        b.classList.add('bunny--sleep');
+      }
+      $('brandLogo').title = 'Zzz… (mové el mouse para despertarlo)';
+    }, DIG_MS);
+  };
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(sleep, IDLE_MS);
+  };
+  const wake = () => {
+    if (state !== 'awake') {
+      clearTimeout(digTimer);
+      const wasAsleep = state === 'asleep';
+      state = 'awake';
+      for (const b of document.querySelectorAll('.bunny--sit.bunny--dig, .bunny--sit.bunny--sleep')) {
+        b.classList.remove('bunny--dig', 'bunny--sleep');
+        // Se levanta de un saltito.
+        if (wasAsleep) {
+          b.classList.add('bunny--wake');
+          setTimeout(() => b.classList.remove('bunny--wake'), 600);
+        }
+      }
+      $('brandLogo').title = '';
+      arm();
+    } else if (Date.now() - lastArm > 1000) {
+      // pointermove es muy frecuente: re-armar a lo sumo una vez por segundo
+      lastArm = Date.now();
+      arm();
+    }
+  };
+  for (const ev of ['pointermove', 'pointerdown', 'keydown', 'wheel']) document.addEventListener(ev, wake, { passive: true, capture: true });
+  arm();
 }
 
 // --- seguridad: la CSP bloquea lo que no sea de la app; queda registrado ------------

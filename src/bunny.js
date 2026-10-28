@@ -2,13 +2,15 @@
  * Conejo SVG inline (no <use>, para poder animar cada parte con CSS).
  * Modos: "sit" (parpadea y mueve las orejas), "hop" (salta en loop), "run"
  * (corre: orejas hacia atrás, polvo y líneas de velocidad) y "dig" (escarba un
- * agujero tirando tierra hacia atrás).
+ * agujero tirando tierra hacia atrás). "sleep" se suma a "sit" cuando la app
+ * queda inactiva: ojos cerrados, orejas caídas, respira y suelta Zzz.
  *
  * Las animaciones del conejo ignoran prefers-reduced-motion a propósito: son la
  * señal de "estoy trabajando" de la app (ver styles.css).
  */
 /** Partes del conejo (viewBox 0 0 64 64), reutilizadas por la escena del aviso. */
 const SHAPES = `
+  <g class="b-zzz"><text x="4" y="16">z</text><text x="0" y="9">z</text><text x="-5" y="3">Z</text></g>
   <ellipse class="b-shadow" cx="34" cy="60" rx="18" ry="2.6"/>
   <path class="b-mound" d="M50 61.5 Q60 49 72 61.5 Z"/>
   <ellipse class="b-hole" cx="11" cy="61" rx="9" ry="2.8"/>
@@ -19,13 +21,14 @@ const SHAPES = `
     <g class="b-ear-b"><ellipse cx="28" cy="13" rx="3.8" ry="11.5" transform="rotate(16 28 22)"/><ellipse class="b-inner" cx="28" cy="13.5" rx="1.6" ry="8" transform="rotate(16 28 22)"/></g>
     <ellipse cx="37" cy="43" rx="17" ry="13.5"/>
     <circle class="b-tail" cx="53.5" cy="39" r="5"/>
-    <ellipse cx="41" cy="55" rx="10" ry="3.6"/>
+    <ellipse class="b-foot" cx="41" cy="55" rx="10" ry="3.6"/>
     <circle cx="22" cy="31" r="10.5"/>
     <g class="b-ear-f"><ellipse cx="20" cy="12" rx="4.2" ry="12" transform="rotate(-8 20 22)"/><ellipse class="b-inner" cx="20" cy="12.5" rx="1.8" ry="8.5" transform="rotate(-8 20 22)"/></g>
     <ellipse class="b-paw" cx="22" cy="54.6" rx="5.6" ry="2.9"/>
     <ellipse class="b-eye" cx="18" cy="29" rx="1.9" ry="2.2"/>
     <circle class="b-nose" cx="12" cy="32.8" r="1.4"/>
-  </g>`;
+  </g>
+  <path class="b-rim" d="M-12 68 Q-9 53.8 12 54.4 Q34 53.8 42 68 Z"/>`;
 const SVG = `<svg class="bunny__svg" viewBox="0 0 64 64" aria-hidden="true">${SHAPES}</svg>`;
 
 export function bunny(mode = 'sit', size = 32) {
@@ -147,6 +150,23 @@ export function terrorScene(level = 0) {
   out.push('</g>');
 
   return `<svg class="stage pray lvl-${L}" viewBox="0 0 240 130" style="--period:${period || 6}s" aria-hidden="true">${out.join('')}</svg>`;
+}
+
+/**
+ * Águila que sobrevuela (mientras se cargan colas): planea de lado a lado,
+ * aletea y es la razón por la que el conejo corre en círculos.
+ */
+export function eagle(size = 64) {
+  return `<span class="eagle" style="--eagle-size:${size}px"><svg class="eagle__svg" viewBox="0 0 64 32" aria-hidden="true">
+    <path class="eagle__wing eagle__wing--back" d="M31 16 Q25 3 9 2 Q15 9 18 12 Q22 15 27 17 Z"/>
+    <path class="eagle__tail" d="M22 17.5 L14 15 L15.5 18.5 L14 22 L22 19.5 Z"/>
+    <ellipse class="eagle__body" cx="31" cy="18" rx="10" ry="4.2"/>
+    <circle class="eagle__head" cx="42.5" cy="15.5" r="3.6"/>
+    <path class="eagle__beak" d="M45.6 14.6 L49.5 15.8 L45.8 17.4 Z"/>
+    <circle class="eagle__eye" cx="43.6" cy="14.8" r="0.7"/>
+    <path class="eagle__wing eagle__wing--front" d="M33 16 Q41 1 59 1 Q50 8 46 11 Q41 15 37 17.5 Z"/>
+    <path class="eagle__talon" d="M30 21.5 l-1.2 3 M33 21.5 l1 3"/>
+  </svg></span>`;
 }
 
 /** Un conejo cruza la barra de estado de punta a punta (festejo breve). */

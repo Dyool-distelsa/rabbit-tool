@@ -111,9 +111,9 @@
 /* Con las animaciones de Windows apagadas, WebView2 reporta reduced-motion. Se
    respeta en toda la UI menos en los conejos: son el indicador de "trabajando". */
 @media (prefers-reduced-motion: reduce) {
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *),
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *)::before,
-  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *)::after {
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *, .qdig__bunny, .eagle, .eagle *),
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *, .qdig__bunny, .eagle, .eagle *)::before,
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash, .pray, .pray *, .qdig__bunny, .eagle, .eagle *)::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     animation-delay: 0s !important;
@@ -879,9 +879,11 @@ input[type='checkbox']:not(.switch):checked::after {
 
 /* Escarbando: cuerpo inclinado hacia el agujero, pata rascando, tierra que
    sale volando hacia atrás y un montículo que crece. */
-.bunny .b-hole, .bunny .b-mound, .bunny .b-dirt { display: none; }
-.bunny--dig .b-hole { display: inline; fill: var(--dirt-dark); }
-.bunny--dig .b-mound { display: inline; fill: var(--dirt); transform-box: fill-box; transform-origin: 50% 100%; animation: b-mound 2.8s ease-out infinite; }
+.bunny .b-hole, .bunny .b-mound, .bunny .b-dirt, .bunny .b-rim { display: none; }
+.bunny--dig .b-hole { display: inline; fill: var(--dirt-dark); transform-box: fill-box; transform-origin: center; animation: b-hole-grow 15s ease-out forwards; }
+@keyframes b-hole-grow { from { transform: scale(0.3, 0.5); } to { transform: scale(1.9, 1.4); } }
+.bunny--dig .b-mound { display: inline; fill: var(--dirt); transform-box: fill-box; transform-origin: 50% 100%; animation: b-mound-grow 15s ease-out forwards; }
+@keyframes b-mound-grow { from { transform: scaleY(0.25); } to { transform: scaleY(1.3); } }
 .bunny--dig .b-dirt { display: inline; fill: var(--dirt); }
 .bunny--dig .b-dirt circle { transform-box: fill-box; transform-origin: center; animation: b-fling 0.75s cubic-bezier(0.3, 0.6, 0.6, 1) infinite; opacity: 0; }
 .bunny--dig .b-dirt circle:nth-child(2) { animation-delay: 0.15s; animation-duration: 0.7s; }
@@ -1254,3 +1256,143 @@ input[type='checkbox']:not(.switch):checked::after {
 .tag--published { background: color-mix(in srgb, #f08a24 18%, transparent); color: #f08a24; }
 .modal label.confirm-check { flex-direction: row; align-items: center; gap: var(--space-3); font-size: var(--text-sm); color: var(--color-text); cursor: pointer; }
 #retention { width: 150px; }
+
+/* --- ayuda (como json-scout) --- */
+.modal__card--help { width: 640px; max-height: calc(100vh - 64px); padding: 0; gap: 0; }
+.help-head { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-5) var(--space-6) var(--space-4); border-bottom: 1px solid var(--color-border); }
+.help-body { overflow-y: auto; padding: var(--space-5) var(--space-6) var(--space-6); }
+.help-panel { display: flex; flex-direction: column; gap: var(--space-6); font-size: var(--text-base); line-height: 1.55; color: var(--color-text); }
+.help-section__title { margin: 0 0 var(--space-3); font-size: var(--text-xs); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-accent-text); }
+.help-text { margin: 0 0 var(--space-3); color: var(--color-text); }
+.help-text--dim { color: var(--color-text-dim); }
+.help-facts { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-2) var(--space-4); margin: 0; }
+.help-facts dt { color: var(--color-text-dim); }
+.help-facts dd { margin: 0; overflow-wrap: anywhere; }
+.help-facts--states dt { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--color-text); }
+.help-mono, .help-code { font-family: var(--font-mono); font-size: var(--text-sm); }
+.help-facts--states dd, .help-facts:not(.help-facts--keys) dd { font-family: var(--font-ui); font-size: var(--text-base); }
+.help-code { padding: 1px 6px; border-radius: var(--radius-sm); background: var(--color-bg-active); }
+.help-row { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-3) 0; }
+.help-link { color: var(--color-accent-text); text-decoration: none; overflow-wrap: anywhere; cursor: pointer; }
+.help-link:hover { text-decoration: underline; }
+.help-steps { margin: 0; padding-left: 20px; }
+.help-steps li { margin-bottom: var(--space-2); }
+.modal label.confirm-check, .help-panel { user-select: text; }
+
+/* --- conejo dormido (app inactiva) --- */
+.bunny .b-zzz { display: none; }
+.bunny--sleep .b-zzz { display: inline; fill: var(--color-text-dim); font: 700 7px var(--font-ui); }
+.bunny--sleep .b-zzz text { opacity: 0; animation: b-zzz 3.6s ease-out infinite; }
+.bunny--sleep .b-zzz text:nth-child(2) { animation-delay: 1.2s; font-size: 8.5px; }
+.bunny--sleep .b-zzz text:nth-child(3) { animation-delay: 2.4s; font-size: 10px; }
+@keyframes b-zzz { 0% { opacity: 0; transform: translate(4px, 6px); } 25% { opacity: 0.85; } 100% { opacity: 0; transform: translate(-4px, -6px); } }
+.bunny--sleep .b-eye { animation: none; transform: scaleY(0.12); }
+.bunny--sleep .b-ear-f { animation: none; transform: rotate(72deg); transition: transform 0.8s ease; }
+.bunny--sleep .b-ear-b { animation: none; transform: rotate(80deg); transition: transform 0.8s ease; }
+/* Se mete en la madriguera que cavó: salta hacia adelante, se hunde en el agujero
+   (el borde de tierra le tapa la mitad de abajo) y duerme asomando la cabeza. */
+.bunny--sleep .b-all { transform-origin: 34px 60px; animation: b-into-hole 1.2s ease-in-out forwards, b-breathe-hole 3.4s ease-in-out 1.2s infinite; }
+@keyframes b-into-hole {
+  0% { transform: translate(0, 0); }
+  35% { transform: translate(-7px, -9px) rotate(-12deg); }
+  70% { transform: translate(-15px, 7px) rotate(-5deg) scale(1.04, 0.9); }
+  100% { transform: translate(-15px, 10px) scale(1.06, 0.86); }
+}
+@keyframes b-breathe-hole {
+  0%, 100% { transform: translate(-15px, 10px) scale(1.06, 0.86); }
+  50% { transform: translate(-15px, 9.4px) scale(1.08, 0.89); }
+}
+.bunny--sleep .b-hole { display: inline; fill: var(--dirt-dark); transform-box: fill-box; transform-origin: 50% 70%; transform: scale(1.9, 2.8); }
+/* Las Z salen de la cabeza, que ahora está más abajo. */
+.bunny--sleep .b-zzz { transform: translate(1px, 20px); }
+.bunny--sleep .b-mound { display: inline; fill: var(--dirt); transform-box: fill-box; transform-origin: 50% 100%; transform: scaleY(1.3); }
+.bunny--sleep .b-rim { display: inline; fill: var(--dirt); stroke: var(--dirt-dark); stroke-width: 0.6; opacity: 0; animation: fade-in-rim 0.4s ease-out 0.8s forwards; }
+@keyframes fade-in-rim { to { opacity: 1; } }
+.bunny--sleep .b-shadow { opacity: 0; }
+/* Dentro del agujero no se le ven las patas. */
+.bunny--sleep .b-paw, .bunny--sleep .b-foot { opacity: 0; transition: opacity 0.3s ease 0.8s; }
+/* Al despertarse: un saltito. */
+.bunny--wake .b-all { animation: b-hop 0.56s cubic-bezier(0.3, 0, 0.4, 1) 1; }
+.brand__logo .bunny--sleep .b-zzz { fill: #1b2f5e; }
+
+/* --- respaldos: metadata del abierto + explorador --- */
+.bkp-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-alt);
+  font-size: var(--text-sm);
+  color: var(--color-text-dim);
+}
+.bkp-meta b { color: var(--color-text); font-weight: 600; }
+.bkp-meta .sep { width: 1px; height: 12px; background: var(--color-border-strong); }
+.bkp-meta .link { color: var(--color-accent-text); cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
+.bkp-meta .link:hover { text-decoration: underline; }
+.chip { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px; border-radius: var(--radius-full); background: var(--color-bg-active); color: var(--color-text); font-size: var(--text-xs); white-space: nowrap; }
+.chip--ok, .chip--done, .chip--republished { background: color-mix(in srgb, var(--color-success) 16%, transparent); color: var(--color-success); }
+.chip--error, .chip--running { background: color-mix(in srgb, var(--color-error) 16%, transparent); color: var(--color-error); }
+.chip--pending, .chip--partial, .chip--stalled, .chip--cancelled { background: color-mix(in srgb, var(--color-warning) 16%, transparent); color: var(--color-warning); }
+.chip--published { background: color-mix(in srgb, #f08a24 18%, transparent); color: #f08a24; }
+.chip--op { background: color-mix(in srgb, var(--color-accent) 16%, transparent); color: var(--color-accent-text); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+
+.modal__card--bkp { width: 820px; max-height: calc(100vh - 64px); padding: 0; gap: 0; }
+.bkp-search { padding: var(--space-3) var(--space-6); border-bottom: 1px solid var(--color-border); display: flex; }
+.bkp-list { overflow-y: auto; padding: var(--space-2) var(--space-3) var(--space-4); }
+.bkp-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.bkp-item:hover { background: var(--color-bg-hover); }
+.bkp-item.current { border-color: color-mix(in srgb, var(--color-accent) 55%, transparent); background: color-mix(in srgb, var(--color-accent) 7%, transparent); }
+.bkp-item__title { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); color: var(--color-text); font-weight: 500; }
+.bkp-item__sub { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); font-size: var(--text-xs); color: var(--color-text-dim); }
+.bkp-item__right { text-align: right; font-size: var(--text-xs); color: var(--color-text-dim); white-space: nowrap; }
+.bkp-item.child { margin-left: var(--space-6); border-left: 2px solid var(--color-border-strong); border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+
+/* Mientras se cargan colas: corre en círculos (vuelta ovalada vista de costado) porque
+   un águila lo sobrevuela. */
+.qdig__bunny { display: inline-block; }
+.qdig__bunny.circling { animation: b-circle 1.6s linear infinite; }
+.qdig__bunny.circling .bunny__svg { animation: b-face-circle 1.6s steps(1) infinite; }
+@keyframes b-circle {
+  0% { transform: translate(-48px, 0) scale(1); }
+  25% { transform: translate(0, 10px) scale(1.12); }
+  50% { transform: translate(48px, 0) scale(1); }
+  75% { transform: translate(0, -10px) scale(0.82); }
+  100% { transform: translate(-48px, 0) scale(1); }
+}
+/* Mira hacia donde corre: a la derecha en la ida, a la izquierda en la vuelta. */
+@keyframes b-face-circle { 0% { transform: scaleX(-1); } 50% { transform: scaleX(1); } }
+.qdig { overflow: hidden; }
+
+/* --- águila (carga de colas) --- */
+.eagle { display: inline-block; width: var(--eagle-size, 64px); height: calc(var(--eagle-size, 64px) / 2); animation: eagle-fly 4.2s ease-in-out infinite; }
+.eagle__svg { width: 100%; height: 100%; overflow: visible; display: block; animation: eagle-face 4.2s steps(1) infinite; }
+.eagle__body, .eagle__wing, .eagle__tail { fill: #5b3b22; }
+.eagle__wing--back { fill: #47301c; }
+.eagle__head { fill: #f2efe6; }
+.eagle__beak { fill: #f2b51b; }
+.eagle__eye { fill: #1c1408; }
+.eagle__talon { stroke: #f2b51b; stroke-width: 1.2; stroke-linecap: round; fill: none; }
+.eagle__wing { transform-box: view-box; transform-origin: 33px 16px; animation: eagle-flap 0.42s ease-in-out infinite alternate; }
+.eagle__wing--back { animation-delay: 0.05s; }
+@keyframes eagle-flap { from { transform: rotate(-14deg) scaleY(1.05); } to { transform: rotate(12deg) scaleY(0.75); } }
+/* Planea de lado a lado sobre el conejo, con un leve vaivén. */
+@keyframes eagle-fly {
+  0% { transform: translate(-70px, 0) rotate(4deg); }
+  25% { transform: translate(0, -8px) rotate(0deg); }
+  50% { transform: translate(70px, 0) rotate(-4deg); }
+  75% { transform: translate(0, 6px) rotate(0deg); }
+  100% { transform: translate(-70px, 0) rotate(4deg); }
+}
+/* Mira hacia donde vuela: la cabeza apunta a la derecha en la ida. */
+@keyframes eagle-face { 0% { transform: scaleX(1); } 50% { transform: scaleX(-1); } }
+.qdig .eagle { margin-bottom: var(--space-2); }

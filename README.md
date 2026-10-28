@@ -5,12 +5,15 @@ Herramienta de escritorio liviana (Tauri + Rust) para administrar mensajes de Ra
 ## Qué hace
 
 - **Colas paginadas**: se cargan a mano, de a 5/10/15/20, con las que tienen mensajes primero (o A–Z) y filtro por nombre o `/regex/` que aplica el broker. Nada se trae solo.
-- **Ver (nack)**: lee hasta N mensajes por AMQP y los devuelve a la cola. Lista virtual con filtro local (texto, `/regex/i`, `!excluir`) y detalle con JSON formateado, properties y headers.
+- **Ver (nack)**: lee páginas de mensajes por AMQP (sin tope: 200k o más) y los devuelve a la cola. Lista virtual con filtro local (texto, `/regex/i`, `!excluir`) y detalle con JSON formateado, properties y headers.
 - **Ack / Mover**: los primeros N o solo los **seleccionados**. Cada lote se respalda en disco (fsync) antes de cualquier ack, se publica con confirmación del broker (`mandatory`) y recién entonces se ackea en origen. Si algo falla, el mensaje vuelve a la cola.
 - **Mover seleccionados**: reconoce los mensajes elegidos por una huella de su contenido; los no elegidos vuelven a la cola en su orden.
 - **Archivo JSON**: carga un array de mensajes desde un `.json`, se filtra y se publica en una cola.
-- **Último respaldo**: cada envío guarda su propio respaldo (`.bkp.jsonl`); desde la pestaña se re-publican sus mensajes, por defecto en la cola de origen.
+- **Respaldos versionados**: cada envío (mover, ack, publicar desde archivo, re-publicar) guarda su propio respaldo (`.bkp.jsonl`) con metadata (perfil, host, vhost, usuario, origen, filtro, duración, resultado). Re-publicar desde un respaldo crea una versión nueva que apunta a la original. Retención configurable.
+- **Confirmación por ambiente**: PROD (rojo, hay que escribir el nombre de la cola), QA (naranja) y DEV (celeste), detectados por el nombre de la cola.
+- **Ayuda** (F1) con cómo funciona, estados del respaldo, atajos y archivos locales.
 - **Log** rotativo con el detalle de cada operación y error (botón "Ver log").
+- **Contraseñas** en el Administrador de credenciales del sistema, no en texto plano.
 
 ## Instalar
 
@@ -27,7 +30,7 @@ Bajá el instalador de la [última release](../../releases/latest):
 | AMQP | `amqp://host:5672` | Para leer, mover y publicar. **No** es el 15672. `amqps://` para TLS. |
 | VHost | `/` | |
 
-Los perfiles se guardan en el equipo, **incluida la contraseña sin cifrar**.
+Los perfiles se guardan en el equipo; la contraseña va al Administrador de credenciales del sistema.
 
 ## Archivos locales
 
