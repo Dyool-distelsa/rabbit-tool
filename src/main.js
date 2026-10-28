@@ -991,6 +991,103 @@ function lastOp(text) {
   $('lastOp').textContent = `${new Date().toLocaleTimeString('es')} · ${text}`;
 }
 
+// --- actividad: trazabilidad de las operaciones principales ------------------------
+// Las últimas ACT_MAX quedan en la barra izquierda (sobreviven a reinicios) y las
+// más viejas se descartan. Cada una va también al log, que rota solo: ahí queda
+// el historial completo.
+const ACT_MAX = 25;
+const ACT_LABEL = { nack: 'nack', ack: 'ack', move: 'traslado', publish: 'carga', republish: 're-publicar', download: 'descarga', export: 'exportar', delete: 'borrado' };
+const ACT_OUTCOME = { cancelled: 'cancelado', partial: 'parcial', stalled: 'incompleto', error: 'error' };
+let acts = store.get('activity', []);
+if (!Array.isArray(acts)) acts = [];
+
+/** Resultado de un envío del backend → ok / partial / error / cancelled / stalled. */
+const outcomeOf = (r) =>
+  r.failed?.length ? (r.ok ? 'partial' : 'error') : r.cancelled ? 'cancelled' : r.stalled ? 'stalled' : r.not_found ? 'partial' : 'ok';
+const noteOf = (r, ...extra) =>
+  [...extra, r.ok < r.total ? `${fmt(r.ok)} de ${fmt(r.total)}` : '', r.failed?.[0] ? `falló: ${r.failed[0]}` : ''].filter(Boolean).join(' · ');
+
+/** Texto de la actividad: strings y {q} (nombres de cola/archivo, resaltados). */
+function actParts(a) {
+  const msgs = `${fmt(a.n)} ${a.n === 1 ? 'mensaje' : 'mensajes'}`;
+  const q = (name) => ({ q: name || '?' });
+  switch (a.op) {
+    case 'nack': return [`nack de ${msgs} de `, q(a.source)];
+    case 'ack': return [`ack de ${msgs} de `, q(a.source)];
+    case 'move': return [`${msgs} de `, q(a.source), ' hacia ', q(a.target)];
+    case 'publish': return [`${msgs} desde `, q(a.source), ' a ', q(a.target)];
+    case 'republish': return [`${msgs} del respaldo de `, q(a.source), ' a ', q(a.target)];
+    case 'download':
+    case 'export': return [`${msgs} de `, q(a.source), ' a archivo'];
+    case 'delete': return [`${msgs} del respaldo de `, q(a.source)];
+    default: return [msgs];
+  }
+}
+
+/**
+ * Registra una operación. `a`: { op, n, source, target?, outcome?, note?, backup? }.
+ * `backup`: id del respaldo que generó (al tocar la actividad se abre).
+ */
+function activity(a) {
+  const entry = { ts: Date.now(), outcome: 'ok', profile: profile()?.name ?? '', ...a };
+  entry.env = worstEnv([entry.source, entry.target, entry.profile])?.level ?? null;
+  acts = [entry, ...acts].slice(0, ACT_MAX);
+  store.set('activity', acts);
+  const text = actParts(entry).map((p) => (typeof p === 'string' ? p : `'${p.q}'`)).join('');
+  const extra = [ACT_OUTCOME[entry.outcome], entry.note, entry.profile && `perfil ${entry.profile}`, entry.backup && `respaldo ${entry.backup}`];
+  log(entry.outcome === 'error' ? 'error' : 'info', `actividad ${ACT_LABEL[entry.op] ?? entry.op}: ${text}${extra.filter(Boolean).map((x) => ` · ${x}`).join('')}`);
+  renderActivity(true);
+}
+
+function renderActivity(fresh = false) {
+  $('activityCount').textContent = acts.length ? `(${acts.length})` : '';
+  const today = new Date().toDateString();
+  const node = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text ?? '' });
+  const frag = document.createDocumentFragment();
+  acts.forEach((a, i) => {
+    const li = node('li', `act${a.env ? ` act--${a.env}` : ''}${fresh && i === 0 ? ' fresh' : ''}`);
+    if (a.backup) {
+      li.dataset.backup = a.backup;
+      li.title = 'Abrir el respaldo de esta operación';
+    }
+    const top = node('div', 'act__top');
+    top.appendChild(node('span', 'chip chip--op', ACT_LABEL[a.op] ?? a.op));
+    if (a.outcome !== 'ok') top.appendChild(node('span', `chip chip--${a.outcome}`, ACT_OUTCOME[a.outcome] ?? a.outcome));
+    const d = new Date(a.ts);
+    const time = node('time', 'act__time', d.toDateString() === today ? d.toLocaleTimeString('es') : d.toLocaleString('es', { dateStyle: 'short', timeStyle: 'medium' }));
+    time.dateTime = d.toISOString();
+    time.title = d.toLocaleString('es', { dateStyle: 'full', timeStyle: 'medium' });
+    top.appendChild(time);
+    const text = node('div', 'act__text');
+    for (const p of actParts(a)) text.append(typeof p === 'string' ? p : node('b', '', p.q));
+    li.append(top, text);
+    const note = [a.note, a.profile && `perfil ${a.profile}`].filter(Boolean).join(' · ');
+    if (note) li.appendChild(node('div', 'act__note', note));
+    frag.appendChild(li);
+  });
+  $('activityList').replaceChildren(frag);
+}
+
+$('activityList').addEventListener('click', async (ev) => {
+  const id = ev.target.closest('.act[data-backup]')?.dataset.backup;
+  if (!id) return;
+  await loadBackups().catch(() => {});
+  if (!S.backups?.some((b) => b.id === id)) return toast.info('Ese respaldo ya no está (se borró)');
+  openBackup(id);
+});
+$('activityToggle').onclick = () => {
+  const collapsed = $('activity').classList.toggle('collapsed');
+  store.set('activityCollapsed', collapsed);
+};
+$('activityClear').onclick = () => {
+  acts = [];
+  store.set('activity', acts);
+  log('info', 'actividad: lista limpiada (el historial sigue en este log)');
+  renderActivity();
+};
+$('activity').classList.toggle('collapsed', !!store.get('activityCollapsed', false));
+renderActivity();
+
 // --- confirmación -----------------------------------------------------------------
 /**
  * Ambiente más riesgoso entre las colas tocadas (y el perfil/vhost como señal
@@ -1091,8 +1188,16 @@ async function peek(offset = 0, { fresh = false } = {}) {
     S.sel = S.qItems.length ? 0 : -1;
     if (S.tab === 'queue') applyFilter();
     lastOp(`${fmt(r.items.length)} mensajes leídos de ${queue} (${range} de ${fmt(r.ready)})`);
+    activity({
+      op: 'nack',
+      n: r.items.length,
+      source: queue,
+      outcome: r.cancelled ? 'cancelled' : r.stalled ? 'stalled' : 'ok',
+      note: r.items.length ? `${fmt(r.offset + 1)}–${fmt(r.offset + r.items.length)} de ${fmt(r.ready)} ready` : `${fmt(r.ready)} ready`,
+    });
   } catch (err) {
     toast.err(`Error leyendo ${queue}: ${err}`);
+    activity({ op: 'nack', n: limit, source: queue, outcome: 'error', note: String(err) });
   } finally {
     showSkeleton(false);
     endOp();
@@ -1198,8 +1303,10 @@ async function drain(target) {
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} ${verb} de ${source}`);
+    if (r.total) activity({ op: target ? 'move' : 'ack', n: r.ok, source, target, backup: r.backup, outcome: outcomeOf(r), note: noteOf(r, all ? 'toda la cola' : '') });
   } catch (err) {
     toast.err(`Error: ${err}. ${INTERRUPTED_HINT}`);
+    activity({ op: target ? 'move' : 'ack', n, source, target, outcome: 'error', note: `${err} · revisá el último respaldo` });
   } finally {
     showSkeleton(false);
     endOp();
@@ -1253,6 +1360,15 @@ async function drainSelected(target) {
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} seleccionados ${verb} de ${source}`);
+    activity({
+      op: target ? 'move' : 'ack',
+      n: r.ok,
+      source,
+      target,
+      backup: r.backup,
+      outcome: outcomeOf(r),
+      note: noteOf(r, 'seleccionados', r.not_found ? `${fmt(r.not_found)} ya no estaban en la cola` : ''),
+    });
 
     // Saca de la lista los que se fueron (por huella, respetando duplicados); el
     // resto sigue en la cola y queda visible.
@@ -1271,6 +1387,7 @@ async function drainSelected(target) {
     clearPicks('queue');
   } catch (err) {
     toast.err(`Error: ${err}. ${INTERRUPTED_HINT}`);
+    activity({ op: target ? 'move' : 'ack', n: k, source, target, outcome: 'error', note: `seleccionados · ${err} · revisá el último respaldo` });
   } finally {
     showSkeleton(false);
     endOp();
@@ -1320,8 +1437,10 @@ $('download').onclick = async () => {
       bunnyDash();
     }
     lastOp(`${fmt(r.written)} descargados de ${queue} a ${r.path}`);
+    activity({ op: 'download', n: r.written, source: queue, outcome: r.cancelled ? 'cancelled' : r.stalled ? 'stalled' : 'ok', note: [r.path, ...extra.filter((x) => !x.startsWith('cancelado'))].join(' · ') });
   } catch (err) {
     toast.err(`No se pudo descargar: ${err}`);
+    activity({ op: 'download', n: all ? 0 : n, source: queue, outcome: 'error', note: String(err) });
   } finally {
     endOp();
     refreshExact([queue]);
@@ -1410,9 +1529,11 @@ $('publishFile').onclick = async () => {
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} publicados desde ${S.fileName} en ${queue}`);
+    activity({ op: 'publish', n: r.ok, source: S.fileName, target: queue, backup: r.backup, outcome: outcomeOf(r), note: noteOf(r, runCtx().filter ? `filtro ${runCtx().filter}` : '') });
     S.picks.file.clear();
   } catch (err) {
     toast.err(`No se pudo publicar: ${err}`);
+    activity({ op: 'publish', n: send.length, source: S.fileName, target: queue, outcome: 'error', note: String(err) });
   } finally {
     endOp();
   }
@@ -1692,9 +1813,11 @@ $('republishSel').onclick = async () => {
       bunnyDash();
     }
     lastOp(`${fmt(r.ok)} re-publicados en ${queue}`);
+    activity({ op: 'republish', n: r.ok, source: send[0]?.source, target: queue, backup: r.backup, outcome: outcomeOf(r), note: noteOf(r) });
     S.picks.local.clear();
   } catch (err) {
     toast.err(`Re-publicación interrumpida: ${err}`);
+    activity({ op: 'republish', n: send.length, source: send[0]?.source, target: queue, outcome: 'error', note: String(err) });
   } finally {
     endOp();
   }
@@ -1744,6 +1867,7 @@ $('exportJson').onclick = async () => {
     if (!path) return;
     toast.ok(`${fmt(items.length)} mensajes exportados a ${path}`);
     lastOp(`${fmt(items.length)} exportados a ${path}`);
+    activity({ op: 'export', n: items.length, source: from, note: path });
   } catch (err) {
     toast.err(`No se pudo exportar: ${err}`);
   }
@@ -1765,6 +1889,7 @@ $('deleteSel').onclick = async () => {
   try {
     const n = await call('delete_local', { items: refsOf(chosen) });
     toast.ok(`${fmt(n)} mensajes borrados del respaldo`);
+    activity({ op: 'delete', n, source: S.backupMeta?.source, note: `respaldo ${S.backupId}` });
     S.picks.local.clear();
   } catch (err) {
     toast.err(`No se pudo borrar: ${err}`);
@@ -1957,6 +2082,7 @@ $('deleteRun').onclick = async () => {
   try {
     await call('delete_backup', { id: b.id });
     toast.ok('Respaldo borrado');
+    activity({ op: 'delete', n: b.count, source: b.source, note: `respaldo completo ${b.id}` });
     S.backupId = null;
     clearPicks('local');
     S.localItems = [];

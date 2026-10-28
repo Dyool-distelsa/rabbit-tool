@@ -13,6 +13,7 @@ Herramienta de escritorio liviana (Tauri + Rust) para administrar mensajes de Ra
 - **Archivo JSON**: carga un array de mensajes desde un `.json` (por ejemplo uno descargado y editado), se filtra y se publica en una cola.
 - **Respaldos versionados**: cada envío (mover, ack, publicar desde archivo, re-publicar) guarda su propio respaldo (`.bkp.jsonl`) con metadata (perfil, host, vhost, usuario, origen, filtro, duración, resultado). Re-publicar desde un respaldo crea una versión nueva que apunta a la original. Por defecto se guardan siempre; la retención (7/30/90 días) es opcional.
 - **Confirmación por ambiente**: PROD (rojo, hay que escribir el nombre de la cola), QA (naranja) y DEV (celeste), detectados por el nombre de la cola.
+- **Actividad**: abajo a la izquierda, las últimas 25 operaciones (nack, ack, traslado, carga, re-publicar, descarga, exportar, borrado) con hora, cantidad, colas, perfil y resultado; el borde marca el ambiente y tocarla abre su respaldo. Las más viejas se descartan; el historial completo queda en el log rotativo.
 - **Ayuda** (F1) con cómo funciona, estados del respaldo, atajos y archivos locales.
 - **Log** rotativo con el detalle de cada operación y error (botón "Ver log").
 - **Contraseñas** en el Administrador de credenciales del sistema, no en texto plano.

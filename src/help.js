@@ -110,6 +110,7 @@ export async function renderHelp(container, { invoke, notify, paths }) {
       [code('Descargar JSON…'), ' guarda N mensajes (o toda la cola) directo en un .json, sin ack: vuelven a la cola. ', code('Exportar JSON…'), ' (junto al filtro) guarda los seleccionados o filtrados de cualquier pestaña.'],
       ['Pestaña ', code('Archivo JSON'), ': cargá un array de mensajes (por ejemplo uno descargado y editado), filtrá y publicá en una cola.'],
       ['Pestaña ', code('Respaldos'), ': cada envío queda guardado; podés abrir cualquiera y volver a cargar sus mensajes.'],
+      [code('Actividad'), ' (abajo a la izquierda): las últimas 25 operaciones con hora, la más reciente arriba; el borde marca el ambiente. Tocar una abre su respaldo. El historial completo queda en el log.'],
     ])
   );
 

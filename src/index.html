@@ -76,6 +76,15 @@
           <span id="pageInfo" class="mono"></span>
           <button class="icon-btn" id="nextPage" title="Página siguiente">›</button>
         </div>
+        <section class="activity" id="activity">
+          <header class="activity__head">
+            <button class="activity__toggle" id="activityToggle" title="Mostrar / ocultar la actividad">
+              <span class="activity__caret" aria-hidden="true">▾</span> Actividad <span class="activity__count" id="activityCount"></span>
+            </button>
+            <button class="icon-btn icon-btn--sm" id="activityClear" title="Limpiar la lista (el detalle sigue en el log)">✕</button>
+          </header>
+          <ol class="activity__list" id="activityList"></ol>
+        </section>
       </aside>
 
       <main class="main">
