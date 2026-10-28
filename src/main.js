@@ -140,6 +140,13 @@ $('connDialog').addEventListener('close', () => {
   const f = $('connDialog').querySelector('form').elements;
   const p = Object.fromEntries(['name', 'api', 'amqp', 'user', 'pass', 'vhost'].map((k) => [k, f[k].value.trim()]));
   if (!p.name) return;
+  // AMQP vacío o apuntando al puerto de management: se arma con el host de la API y 5672.
+  const apiHost = p.api.replace(/^https?:\/\//, '').split(/[/:]/)[0];
+  if (!p.amqp || /:15672\/?$/.test(p.amqp)) {
+    const fixed = `amqp://${apiHost || 'localhost'}:5672`;
+    if (p.amqp) toast.info(`AMQP apuntaba al puerto de management (15672); lo cambié a ${fixed}`);
+    p.amqp = fixed;
+  }
   const i = profiles.findIndex((x) => x.name === p.name);
   if (i >= 0) profiles[i] = p;
   else profiles.push(p);
@@ -200,8 +207,15 @@ async function connect() {
   try {
     const r = await busy($('connect'), () => call('ping', { conn: c }));
     setConnected(true);
-    setConn('ok', `${r.user}@${hostOf(c)} · vhost ${c.vhost}${r.messages != null ? ` · ${fmt(r.messages)} mensajes` : ''}`);
-    toast.ok(`Conectado a ${profile().name}`);
+    const info = `${r.user}@${hostOf(c)} · vhost ${c.vhost}${r.queues != null ? ` · ${fmt(r.queues)} colas` : ''}`;
+    if (r.amqp_error) {
+      // Management responde: se pueden listar colas, pero leer/mover necesita AMQP.
+      setConn('busy', `${info} · AMQP con error`);
+      toast.err(`Management OK, pero AMQP falló: ${r.amqp_error}. "Ver" y "Mover" no van a funcionar hasta corregir el campo AMQP.`);
+    } else {
+      setConn('ok', info);
+      toast.ok(`Conectado a ${profile().name}`);
+    }
     if (!S.qpage) $('qemptyText').innerHTML = 'Conectado.<br />Filtrá si querés y tocá <b>Cargar</b>.';
   } catch (err) {
     setConnected(false);

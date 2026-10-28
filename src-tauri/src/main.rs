@@ -265,10 +265,21 @@ async fn send(rb: reqwest::RequestBuilder) -> R<Value> {
     if !status.is_success() {
         let short: String = body.chars().take(500).collect();
         log::error!("HTTP {method} {url} → {status}: {short}");
-        return Err(match status.as_u16() {
-            401 => "HTTP 401: usuario o contraseña incorrectos".into(),
-            404 => format!("HTTP 404: no existe ({short})"),
-            _ => format!("HTTP {status}: {short}"),
+        // El broker explica el motivo en {"error","reason"}: se usa tal cual, porque
+        // un 401 puede ser credenciales malas o un endpoint que exige admin.
+        let reason = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["reason"].as_str().map(str::to_string))
+            .unwrap_or(short);
+        let path = url.path();
+        return Err(match (status.as_u16(), reason.as_str()) {
+            (401, "Not_Authorized") => "HTTP 401: usuario o contraseña incorrectos".into(),
+            (401, r) if r.contains("administrator") => {
+                format!("HTTP 401 en {path}: el usuario no es administrador ({r})")
+            }
+            (401, r) => format!("HTTP 401 en {path}: sin permisos ({r})"),
+            (404, r) => format!("HTTP 404 en {path}: no existe ({r})"),
+            (_, r) => format!("HTTP {status} en {path}: {r}"),
         });
     }
     serde_json::from_str(&body).map_err(e)
@@ -276,6 +287,14 @@ async fn send(rb: reqwest::RequestBuilder) -> R<Value> {
 
 /// Canal nuevo sobre la conexión cacheada (reconecta si cambió o se cayó).
 async fn channel(state: &AppState, c: &Conn) -> R<Channel> {
+    let (_, host) = c.amqp_host();
+    if host.ends_with(":15672") {
+        log::error!("el campo AMQP apunta al puerto de management: {host}");
+        return Err(format!(
+            "El campo AMQP apunta a {host}, que es el puerto de management. \
+             AMQP suele ser el 5672 (amqp://host:5672)"
+        ));
+    }
     let uri = c.amqp_uri();
     let mut guard = state.amqp.lock().await;
     if let Some((u, conn)) = guard.as_ref() {
@@ -342,17 +361,39 @@ fn progress(app: &AppHandle, op: &str, done: u32, total: u32) {
 
 // --- comandos -------------------------------------------------------------------
 
-/// Verifica credenciales y vhost sin listar colas.
+/// Verifica credenciales, acceso al vhost y AMQP, sin listar colas. Solo usa
+/// endpoints que no exigen el tag administrator (como hermes-diagnostics).
 #[tauri::command]
-async fn ping(conn: Conn) -> R<Value> {
+async fn ping(state: State<'_, AppState>, conn: Conn) -> R<Value> {
     log::info!("ping: {}", conn.desc());
     let who = send(http(&conn, reqwest::Method::GET, "whoami")).await?;
-    let vh = send(http(&conn, reqwest::Method::GET, &format!("vhosts/{}", conn.vh()))).await?;
-    log::info!("ping ok: usuario={} mensajes en vhost={}", who["name"], vh["messages"]);
+    log::info!("whoami: usuario={} tags={}", who["name"], who["tags"]);
+    // Una página de 1 cola: valida que el vhost exista y sea accesible, y da el total.
+    let q = send(http(
+        &conn,
+        reqwest::Method::GET,
+        &format!("queues/{}?page=1&page_size=1&columns=name", conn.vh()),
+    ))
+    .await
+    .map_err(|err| format!("vhost \"{}\": {err}", conn.vhost))?;
+
+    // AMQP se prueba ya, para que un puerto o permiso mal no aparezca recién al leer.
+    let amqp_error = match channel(&state, &conn).await {
+        Ok(ch) => {
+            let _ = ch.close(200, "ok").await;
+            None
+        }
+        Err(err) => Some(err),
+    };
+    log::info!(
+        "ping ok: colas en vhost={} amqp={}",
+        q["total_count"],
+        amqp_error.as_deref().unwrap_or("ok")
+    );
     Ok(json!({
         "user": who["name"],
-        "messages": vh["messages"].as_u64(),
-        "ready": vh["messages_ready"].as_u64(),
+        "queues": q["total_count"].as_u64(),
+        "amqp_error": amqp_error,
     }))
 }
 
