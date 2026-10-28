@@ -9,8 +9,9 @@ Herramienta de escritorio liviana (Tauri + Rust) para administrar mensajes de Ra
 - **Filtro local**: texto, `/regex/i`, `campo=valor` (también `"DESTINO": 64000000` pegado del JSON, en cualquier nivel o por ruta `pedido.destino`), `!excluir`. Al publicar sin selección se envían solo los filtrados.
 - **Ack / Mover**: los primeros N o solo los **seleccionados**. Cada lote se respalda en disco (fsync) antes de cualquier ack, se publica con confirmación del broker (`mandatory`) y recién entonces se ackea en origen. Si algo falla, el mensaje vuelve a la cola.
 - **Mover seleccionados**: reconoce los mensajes elegidos por una huella de su contenido; los no elegidos vuelven a la cola en su orden.
-- **Archivo JSON**: carga un array de mensajes desde un `.json`, se filtra y se publica en una cola.
-- **Respaldos versionados**: cada envío (mover, ack, publicar desde archivo, re-publicar) guarda su propio respaldo (`.bkp.jsonl`) con metadata (perfil, host, vhost, usuario, origen, filtro, duración, resultado). Re-publicar desde un respaldo crea una versión nueva que apunta a la original. Retención configurable.
+- **Descargar / exportar JSON**: `Descargar JSON…` guarda N mensajes (o toda la cola) directo en un `.json` editable, sin ack (vuelven a la cola), sin tope. `Exportar JSON…` guarda los seleccionados o filtrados de cualquier pestaña (cola, archivo o respaldo). El payload se copia tal cual (sin tocar números ni el orden de los campos); opcionalmente con properties y headers.
+- **Archivo JSON**: carga un array de mensajes desde un `.json` (por ejemplo uno descargado y editado), se filtra y se publica en una cola.
+- **Respaldos versionados**: cada envío (mover, ack, publicar desde archivo, re-publicar) guarda su propio respaldo (`.bkp.jsonl`) con metadata (perfil, host, vhost, usuario, origen, filtro, duración, resultado). Re-publicar desde un respaldo crea una versión nueva que apunta a la original. Por defecto se guardan siempre; la retención (7/30/90 días) es opcional.
 - **Confirmación por ambiente**: PROD (rojo, hay que escribir el nombre de la cola), QA (naranja) y DEV (celeste), detectados por el nombre de la cola.
 - **Ayuda** (F1) con cómo funciona, estados del respaldo, atajos y archivos locales.
 - **Log** rotativo con el detalle de cada operación y error (botón "Ver log").

@@ -1493,6 +1493,275 @@ async fn prune_backups(app: AppHandle, days: u32) -> R<Value> {
     .await
 }
 
+// --- exportar a JSON editable ------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ExportMsg {
+    payload: String,
+    #[serde(default)]
+    properties: Option<Value>,
+    #[serde(default)]
+    routing_key: Option<String>,
+}
+
+/// Re-indenta JSON válido sin parsearlo: números, escapes y orden de los campos
+/// quedan tal cual (parsear y volver a escribir cambiaría 12.10 → 12.1 o enteros
+/// grandes). `level`: indentación inicial, en pasos de dos espacios.
+fn pretty_raw(src: &str, level: usize) -> String {
+    let mut out = String::with_capacity(src.len() + src.len() / 3);
+    let (mut d, mut in_str, mut esc, mut open) = (level, false, false, false);
+    let nl = |out: &mut String, d: usize| {
+        out.push('\n');
+        out.extend(std::iter::repeat_n("  ", d));
+    };
+    for c in src.chars() {
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            continue;
+        }
+        // Tras abrir un objeto/array se baja de línea, salvo que esté vacío.
+        let was_open = std::mem::take(&mut open);
+        let close = matches!(c, '}' | ']');
+        if was_open && !close {
+            nl(&mut out, d);
+        }
+        match c {
+            '{' | '[' => {
+                out.push(c);
+                d += 1;
+                open = true;
+            }
+            '}' | ']' => {
+                d = d.saturating_sub(1);
+                if !was_open {
+                    nl(&mut out, d);
+                }
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                nl(&mut out, d);
+            }
+            ':' => out.push_str(": "),
+            '"' => {
+                out.push(c);
+                in_str = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Payload como valor JSON del archivo: si es JSON va tal cual (re-indentado); si
+/// no, como string (la pestaña Archivo JSON lo publica igual, como texto). Un
+/// payload que es un string JSON también va como string, con sus comillas: si no,
+/// al volver a cargarlo se publicaría sin ellas.
+fn export_body(payload: &str, level: usize) -> R<String> {
+    let is_str = payload.trim_start().starts_with('"');
+    if !is_str && serde_json::from_str::<serde::de::IgnoredAny>(payload).is_ok() {
+        Ok(pretty_raw(payload, level))
+    } else {
+        serde_json::to_string(payload).map_err(e)
+    }
+}
+
+/// Archivo .json (array) que se escribe de a un mensaje, sin juntarlos en memoria.
+/// Sin `full` cada elemento es solo el payload; con `full` es un sobre
+/// {payload, properties, routing_key} para reenviar con los mismos headers. Se
+/// escribe en un .tmp y recién al terminar se renombra: un corte no deja un archivo
+/// a medias ni pisa el que había.
+struct JsonOut {
+    f: std::io::BufWriter<std::fs::File>,
+    tmp: PathBuf,
+    path: PathBuf,
+    full: bool,
+    n: u32,
+}
+
+impl JsonOut {
+    fn create(path: PathBuf, full: bool) -> R<Self> {
+        let tmp = path.with_extension("json.tmp");
+        let f = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(e)?);
+        Ok(JsonOut { f, tmp, path, full, n: 0 })
+    }
+
+    fn put(&mut self, s: &str) -> R<()> {
+        use std::io::Write;
+        self.f.write_all(s.as_bytes()).map_err(e)
+    }
+
+    fn push(&mut self, payload: &str, properties: Option<&Value>, routing_key: &str) -> R<()> {
+        let sep = if self.n == 0 { "[\n  " } else { ",\n  " };
+        let item = if self.full {
+            let props = serde_json::to_string_pretty(properties.unwrap_or(&json!({})))
+                .map_err(e)?
+                .replace('\n', "\n    ");
+            let rk = serde_json::to_string(routing_key).map_err(e)?;
+            format!(
+                "{{\n    \"payload\": {},\n    \"properties\": {props},\n    \"routing_key\": {rk}\n  }}",
+                export_body(payload, 2)?
+            )
+        } else {
+            export_body(payload, 1)?
+        };
+        self.put(sep)?;
+        self.put(&item)?;
+        self.n += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> R<String> {
+        use std::io::Write;
+        let end = if self.n == 0 { "[]\n" } else { "\n]\n" };
+        let r = self
+            .put(end)
+            .and_then(|_| self.f.flush().map_err(e))
+            .and_then(|_| std::fs::rename(&self.tmp, &self.path).map_err(e));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        r.map(|_| self.path.display().to_string())
+    }
+
+    fn abort(self) {
+        let tmp = self.tmp.clone();
+        drop(self);
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+/// Diálogo "Guardar como" (.json). None si se canceló.
+async fn ask_save_path(app: &AppHandle, title: &'static str, name: String) -> R<Option<PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+    let app = app.clone();
+    blocking(move || {
+        match app
+            .dialog()
+            .file()
+            .set_title(title)
+            .set_file_name(&name)
+            .add_filter("JSON", &["json"])
+            .blocking_save_file()
+        {
+            Some(p) => p.into_path().map(Some).map_err(e),
+            None => Ok(None),
+        }
+    })
+    .await
+}
+
+/// Guarda mensajes que ya tiene la UI (seleccionados o filtrados) en un .json
+/// editable que la pestaña Archivo JSON vuelve a cargar. Devuelve la ruta elegida,
+/// o null si se canceló el diálogo.
+#[tauri::command]
+async fn export_json(app: AppHandle, name: String, messages: Vec<ExportMsg>, full: bool) -> R<Option<String>> {
+    let Some(path) = ask_save_path(&app, "Exportar mensajes a JSON", name).await? else {
+        return Ok(None);
+    };
+    blocking(move || {
+        let mut out = JsonOut::create(path, full)?;
+        for m in &messages {
+            if let Err(err) = out.push(&m.payload, m.properties.as_ref(), m.routing_key.as_deref().unwrap_or("")) {
+                out.abort();
+                return Err(err);
+            }
+        }
+        let path = out.finish()?;
+        log::info!("exportados {} mensajes (full={full}) a {path}", messages.len());
+        Ok(Some(path))
+    })
+    .await
+}
+
+/// Descarga `count` mensajes de la cola directo a un .json (para analizar o editar
+/// y volver a cargar), sin pasar por la lista de la UI y sin tope. Se leen sin ack
+/// y al final vuelven todos a la cola con nack+requeue, igual que "Ver".
+#[tauri::command]
+async fn download_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conn: Conn,
+    queue: String,
+    count: u32,
+    full: bool,
+    name: String,
+) -> R<Value> {
+    let ready = ready_count(&conn, &state, &queue).await?;
+    let total = ready.min(count);
+    if total == 0 {
+        return Err(format!("la cola \"{queue}\" no tiene mensajes ready"));
+    }
+    let Some(path) = ask_save_path(&app, "Descargar mensajes a JSON", name).await? else {
+        return Ok(json!({ "path": null }));
+    };
+    log::info!("download \"{queue}\" {total} mensajes (full={full}) → {} {}", path.display(), conn.desc());
+    begin(&state);
+    let t = std::time::Instant::now();
+    let mut out = sync_io(|| JsonOut::create(path, full))?;
+    progress(&app, "download", 0, total);
+    let ch = channel(&state, &conn).await?;
+    let mut reader = Reader::new(&ch, &queue, total);
+    let (mut last_tag, mut seen, mut binary, mut stopped) = (0, 0u32, 0u32, false);
+    let result = async {
+        while let Some(d) = reader.next().await? {
+            last_tag = d.delivery_tag;
+            if cancelled(&state) {
+                stopped = true;
+                break;
+            }
+            let (payload, is_bin) = payload_text(&d.data);
+            if is_bin {
+                binary += 1;
+            } else {
+                let props = full.then(|| props_json(&d.properties));
+                out.push(&payload, props.as_ref(), d.routing_key.as_str())?;
+            }
+            seen += 1;
+            if seen % 500 == 0 {
+                progress(&app, "download", seen, total);
+            }
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if last_tag > 0 {
+        if let Err(err) = ch
+            .basic_nack(last_tag, BasicNackOptions { multiple: true, requeue: true })
+            .await
+        {
+            log::warn!("download \"{queue}\": nack falló ({err:?}), se requeuean al cerrar el canal");
+        }
+    }
+    let _ = ch.close(200, "ok").await;
+    if let Err(err) = result {
+        out.abort();
+        return Err(err);
+    }
+    let written = out.n;
+    // Cancelado o detenido: se guarda lo leído hasta ahí (el archivo queda válido).
+    let path = sync_io(|| out.finish())?;
+    let stalled = !stopped && seen < total;
+    log::info!(
+        "download \"{queue}\": {written} mensajes a {path} (leídos {seen}/{total}, binarios {binary}, cancelado={stopped}, detenido={stalled}) en {:?}",
+        t.elapsed()
+    );
+    Ok(json!({
+        "path": path, "written": written, "total": total, "binary": binary,
+        "cancelled": stopped, "stalled": stalled,
+    }))
+}
+
 #[tauri::command]
 async fn backup_path(app: AppHandle) -> R<String> {
     Ok(backup_dir(&app)?.display().to_string())
@@ -1676,6 +1945,7 @@ fn main() {
             );
             Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             ping,
@@ -1690,6 +1960,8 @@ fn main() {
             republish,
             delete_local,
             backup_path,
+            export_json,
+            download_queue,
             delete_backup,
             prune_backups,
             secret_set,

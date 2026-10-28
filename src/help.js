@@ -107,7 +107,8 @@ export async function renderHelp(container, { invoke, notify, paths }) {
       ['Las colas no se cargan solas: filtrá por nombre o ', code('/regex/'), ' y tocá ', code('Cargar'), ' (de a 5–20, con mensajes primero o A–Z).'],
       [code('Ver (nack)'), ' lee una página de mensajes y los devuelve a la cola. El filtro local busca en payload, headers y routing key.'],
       ['Marcá mensajes (o “toda la cola”) y usá ', code('Ack'), ' o ', code('Mover →'), '. Sin selección actúan sobre los primeros N.'],
-      ['Pestaña ', code('Archivo JSON'), ': cargá un array de mensajes, filtrá y publicá en una cola.'],
+      [code('Descargar JSON…'), ' guarda N mensajes (o toda la cola) directo en un .json, sin ack: vuelven a la cola. ', code('Exportar JSON…'), ' (junto al filtro) guarda los seleccionados o filtrados de cualquier pestaña.'],
+      ['Pestaña ', code('Archivo JSON'), ': cargá un array de mensajes (por ejemplo uno descargado y editado), filtrá y publicá en una cola.'],
       ['Pestaña ', code('Respaldos'), ': cada envío queda guardado; podés abrir cualquiera y volver a cargar sus mensajes.'],
     ])
   );

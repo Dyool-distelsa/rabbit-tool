@@ -974,7 +974,7 @@ function endOp() {
 }
 
 function setActionsDisabled(on) {
-  for (const id of ['peek', 'ack', 'move', 'countAll']) $(id).disabled = on;
+  for (const id of ['peek', 'download', 'ack', 'move', 'countAll', 'exportJson']) $(id).disabled = on;
   renderSelection();
   renderPager();
 }
@@ -1285,6 +1285,48 @@ const INTERRUPTED_HINT =
   'Revisá “Último respaldo”: “pending” = sigue en origen; “published” = llegó al destino pero no se sacó del origen (posible duplicado).';
 
 $('peek').onclick = () => peek(0, { fresh: true });
+
+/**
+ * Descarga directa a .json para analizar/editar y volver a cargar desde Archivo
+ * JSON: N mensajes (o toda la cola si está seleccionada), sin pasar por la lista
+ * y sin tope. Se leen sin ack y vuelven todos a la cola, como "Ver".
+ */
+$('download').onclick = async () => {
+  if (!S.current || S.op) return;
+  const queue = S.current;
+  const all = S.allQueue;
+  const n = all ? 2 ** 31 : count();
+  const yes = await ask({
+    title: `Descargar ${all ? 'toda la cola' : `${fmt(n)} mensajes`} de “${queue}” a JSON`,
+    body: 'Se leen sin ack y vuelven todos a la cola al terminar (como Ver). Van directo al archivo, sin pasar por la lista: sirve para cientos de miles.\n\nQueda un array: cada elemento es el mensaje tal cual (sin tocar números ni el orden de los campos). Editalo y cargalo desde la pestaña Archivo JSON → Abrir JSON…',
+    ok: 'Elegir archivo…',
+    check: { label: 'Incluir properties, headers y routing key (reenviar igual que el original)', checked: false },
+  });
+  if (!yes) return;
+  const full = $('confirmCheck').checked;
+  startOp(`Descargando ${queue} a JSON…`, all ? 0 : n, { mode: 'run', cancellable: true });
+  try {
+    const r = await call('download_queue', { conn: conn(), queue, count: n, full, name: `${fileSafe(queue)}-${stamp()}.json` });
+    if (!r.path) return;
+    const extra = [
+      r.binary ? `${fmt(r.binary)} binarios quedaron afuera` : '',
+      r.cancelled ? 'cancelado: se guardó lo leído hasta ahí' : '',
+      r.stalled ? 'la cola dejó de entregar antes (¿otro consumidor?)' : '',
+    ].filter(Boolean);
+    const msg = `${fmt(r.written)} de ${fmt(r.total)} mensajes guardados en ${r.path}${extra.length ? ` · ${extra.join(' · ')}` : ''}`;
+    if (r.cancelled || r.stalled) toast.info(msg);
+    else {
+      toast.ok(msg);
+      bunnyDash();
+    }
+    lastOp(`${fmt(r.written)} descargados de ${queue} a ${r.path}`);
+  } catch (err) {
+    toast.err(`No se pudo descargar: ${err}`);
+  } finally {
+    endOp();
+    refreshExact([queue]);
+  }
+};
 $('ack').onclick = () => drain(null);
 $('move').onclick = () => {
   const t = $('target').value.trim();
@@ -1295,12 +1337,21 @@ $('move').onclick = () => {
 };
 
 // --- archivo JSON -------------------------------------------------------------------
+/**
+ * Reviver de JSON.parse: un número que no sobrevive tal cual a JS (12.10, enteros
+ * de más de 15 dígitos) queda con su texto original, así se publica sin cambios.
+ */
+const keepNumbers =
+  typeof JSON.rawJSON === 'function'
+    ? (_k, v, ctx) => (typeof v === 'number' && ctx?.source && String(v) !== ctx.source ? JSON.rawJSON(ctx.source) : v)
+    : undefined;
+
 $('openFile').onclick = () => $('fileInput').click();
 $('fileInput').onchange = async () => {
   const f = $('fileInput').files[0];
   if (!f) return;
   try {
-    let data = JSON.parse(await f.text());
+    let data = JSON.parse(await f.text(), keepNumbers);
     if (!Array.isArray(data)) {
       // Tolerancia: {"messages": [...]} también vale.
       if (data && Array.isArray(data.messages)) data = data.messages;
@@ -1652,6 +1703,52 @@ $('republishSel').onclick = async () => {
   refreshExact([queue]);
 };
 
+// --- exportar a JSON editable (se reenvía desde la pestaña Archivo JSON) --------------
+const fileSafe = (s) => (s || 'mensajes').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80);
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+$('exportJson').onclick = async () => {
+  if (S.op) return;
+  // Seleccionados, o todos los que deja ver el filtro.
+  const picked = picks().size > 0;
+  const chosen = picked ? pickedItems() : S.view;
+  const items = chosen.filter((it) => !it.binary);
+  const binary = chosen.length - items.length;
+  if (!items.length) return toast.info(chosen.length ? 'Los mensajes elegidos son binarios: no se pueden exportar a JSON' : 'No hay mensajes para exportar');
+  const filter = $('filter').value.trim();
+  const from =
+    S.tab === 'queue' ? S.current : S.tab === 'file' ? S.fileName?.replace(/\.json$/i, '') : `${S.backupMeta?.source ?? 'respaldo'}-respaldo`;
+  const notes = [
+    picked ? 'Los seleccionados.' : filter ? `Los que pasan el filtro: ${filter}.` : 'Todos los que se ven.',
+    S.tab === 'queue' ? 'Solo los mensajes leídos (la página cargada), no toda la cola.' : '',
+    binary ? `${fmt(binary)} binarios quedan afuera.` : '',
+  ].filter(Boolean);
+  const yes = await ask({
+    title: `Exportar ${fmt(items.length)} ${items.length === 1 ? 'mensaje' : 'mensajes'} a JSON`,
+    body: `${notes.join(' ')}\n\nQueda un array: cada elemento es el mensaje tal cual (sin tocar números ni el orden de los campos). Editalo y reenvialo desde la pestaña Archivo JSON → Abrir JSON…`,
+    ok: 'Elegir archivo…',
+    check: { label: 'Incluir properties, headers y routing key (reenviar igual que el original)', checked: false },
+  });
+  if (!yes) return;
+  const full = $('confirmCheck').checked;
+  try {
+    const path = await call('export_json', {
+      name: `${fileSafe(from)}-${stamp()}.json`,
+      full,
+      messages: items.map((it) => ({ payload: it.payload, properties: it.properties ?? null, routing_key: it.routing_key || '' })),
+    });
+    if (!path) return;
+    toast.ok(`${fmt(items.length)} mensajes exportados a ${path}`);
+    lastOp(`${fmt(items.length)} exportados a ${path}`);
+  } catch (err) {
+    toast.err(`No se pudo exportar: ${err}`);
+  }
+};
+
 $('deleteSel').onclick = async () => {
   const chosen = pickedItems('local');
   if (!chosen.length) return;
@@ -1826,7 +1923,7 @@ call('log_path', undefined, { quiet: true }).then((p) => {
 $('openLog').onclick = () => call('reveal_log', undefined, { quiet: true }).catch((err) => toast.err(`No se pudo abrir el log: ${err}`));
 
 // --- retención y borrado de respaldos --------------------------------------------
-$('retention').value = String(store.get('retentionDays', 30));
+$('retention').value = String(store.get('retentionDays', 0));
 async function pruneBackups() {
   const days = Number($('retention').value);
   if (!days) return;

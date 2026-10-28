@@ -100,8 +100,9 @@
             <option value="5000">5.000 / pág.</option>
           </select>
           <button class="btn" id="peek" title="Lee la primera página y la devuelve a la cola (Ctrl+R)">Ver (nack)</button>
+          <button class="btn" id="download" title="Descargar JSON: Lee N mensajes (o toda la cola) sin ack y los guarda directo en un .json editable; vuelven a la cola al terminar">⤓ JSON</button>
           <span class="divider"></span>
-          <label class="field" title="Cantidad a ackear o mover (sin selección). Sin tope: “Todos” usa todos los ready.">
+          <label class="field" title="Cantidad a ackear o mover, o a descargar (sin selección). Sin tope: “Todos” usa todos los ready.">
             N <input id="count" type="number" value="100" min="1" />
           </label>
           <button class="btn btn--sm btn--ghost" id="countAll" title="Poner N = todos los mensajes ready de la cola">Todos</button>
@@ -155,6 +156,7 @@
           <span class="sel-pill" id="selCount" hidden></span>
           <button class="btn btn--sm sel-all-queue" id="selQueue" hidden></button>
           <span class="dim" id="shown"></span>
+          <button class="btn btn--sm" id="exportJson" title="Guarda los seleccionados (o los visibles) en un .json editable; se reenvía desde la pestaña Archivo JSON">Exportar JSON…</button>
           <div class="msg-pager" id="msgPager" hidden>
             <button class="icon-btn" id="msgPrev" title="Página anterior">‹</button>
             <span class="mono" id="msgPageInfo"></span>
