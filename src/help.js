@@ -133,6 +133,22 @@ export async function renderHelp(container, { invoke, notify, paths }) {
   );
   envs.appendChild(el('p', 'help-text help-text--dim', 'Se mira la cola (y el perfil/vhost). La escena del conejo se pone más oscura cada 10.000 mensajes.'));
 
+  // Filtro
+  const filt = section('Filtro de mensajes');
+  filt.appendChild(el('p', 'help-text', 'Sirve en la cola, el archivo JSON y los respaldos. Varios términos separados por espacio: tienen que cumplirse todos.'));
+  filt.appendChild(
+    facts([
+      ['texto  o  "una frase"', 'Busca en payload, headers, properties y routing key.'],
+      ['/regex/i', 'Expresión regular.'],
+      ['DESTINO=64000000', 'El campo con ese valor, en cualquier nivel del JSON (también DESTINO:64000000 o "DESTINO": 64000000 pegado del JSON).'],
+      ['pedido.destino=64000000', 'Con punto es una ruta exacta. También headers.x-retry=2 o properties.message_id=abc.'],
+      ['DESTINO!=64000000', 'El campo no tiene ese valor.'],
+      ['DESTINO=*', 'El campo existe.'],
+      ['!término', 'Excluye: !DESTINO=64000000 deja afuera esos mensajes.'],
+    ], 'help-facts--states')
+  );
+  filt.appendChild(el('p', 'help-text help-text--dim', 'Al publicar o re-publicar sin selección se envían los que deja ver el filtro, y el respaldo nuevo guarda solo esos (con el filtro anotado).'));
+
   // Atajos
   const keys = section('Atajos de teclado');
   keys.appendChild(facts(SHORTCUTS, 'help-facts--keys'));
@@ -176,6 +192,6 @@ export async function renderHelp(container, { invoke, notify, paths }) {
   const credits = section('Créditos');
   credits.appendChild(el('p', 'help-text', `Creado y mantenido por ${AUTHOR}, dueño del repositorio.`));
 
-  root.append(about, credits, how, safety, envs, keys, files, repoSec, contrib);
+  root.append(about, credits, how, filt, safety, envs, keys, files, repoSec, contrib);
   container.appendChild(root);
 }

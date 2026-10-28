@@ -567,29 +567,110 @@ function hay(it) {
   return it;
 }
 
-function buildMatcher(raw) {
-  let f = raw.trim();
-  if (!f) return null;
-  let neg = false;
-  if (f.startsWith('!') && f.length > 1) {
-    neg = true;
-    f = f.slice(1);
-  }
-  let test;
-  const m = f.match(/^\/(.+)\/([gimsuy]*)$/);
-  if (m) {
-    let re;
-    try {
-      re = new RegExp(m[1], m[2].replace('g', '') || 'i');
-    } catch (err) {
-      return { error: err.message };
+/**
+ * Índice de campos de un item (se arma una vez): nombre de campo → valores (en
+ * cualquier nivel del JSON del payload, properties y headers) y ruta → valores.
+ * Las rutas se guardan también sin índices de array (`items.sku` = `items.0.sku`).
+ */
+function fieldIndex(it) {
+  if (it._idx) return it._idx;
+  const byKey = new Map();
+  const byPath = new Map();
+  const push = (map, k, v) => {
+    const arr = map.get(k);
+    if (arr) arr.push(v);
+    else map.set(k, [v]);
+  };
+  const add = (path, key, v) => {
+    const sv = v === null ? 'null' : String(v);
+    push(byKey, key.toLowerCase(), sv);
+    const p = path.toLowerCase();
+    push(byPath, p, sv);
+    const noIdx = p.replace(/\.\d+(?=\.|$)/g, '');
+    if (noIdx !== p) push(byPath, noIdx, sv);
+  };
+  const walk = (v, path, key, depth) => {
+    if (depth > 16) return;
+    if (v && typeof v === 'object') {
+      const isArr = Array.isArray(v);
+      for (const [k, child] of Object.entries(v)) walk(child, path ? `${path}.${k}` : k, isArr ? key : k, depth + 1);
+    } else if (key != null) {
+      add(path, key, v);
     }
-    test = (it) => re.test(hay(it)._hay);
-  } else {
-    const low = f.toLowerCase();
-    test = (it) => hay(it)._low.includes(low);
+  };
+  const t = (it.payload || '').trimStart();
+  if (t[0] === '{' || t[0] === '[') {
+    try {
+      walk(JSON.parse(it.payload), '', null, 0);
+    } catch {}
   }
-  return { test: neg ? (it) => !test(it) : test };
+  const { headers, ...props } = it.properties || {};
+  walk(props, 'properties', null, 0);
+  walk(headers || {}, 'headers', null, 0);
+  for (const k of ['routing_key', 'exchange', 'status', 'source', 'target']) if (it[k] != null && it[k] !== '') add(k, k, it[k]);
+  it._idx = { byKey, byPath };
+  return it._idx;
+}
+
+const isNum = (s) => s !== '' && !Number.isNaN(Number(s));
+
+/** campo=valor / campo!=valor / campo=* sobre el índice del item. */
+function fieldTest(field, op, value) {
+  const f = field.toLowerCase();
+  const want = value.toLowerCase();
+  const eq = (sv) => want === '*' || sv.toLowerCase() === want || (isNum(sv) && isNum(want) && Number(sv) === Number(want));
+  return (it) => {
+    const { byKey, byPath } = fieldIndex(it);
+    const vals = (f.includes('.') ? byPath.get(f) : byKey.get(f)) || [];
+    const hit = vals.some(eq);
+    return op === '!=' ? !hit : hit;
+  };
+}
+
+// Un término del filtro: campo(op)valor | /regex/flags | "texto con espacios" | palabra.
+// Cualquiera puede empezar con ! para excluir.
+const TERM =
+  /(!?)(?:"([^"]+)"|([A-Za-z_$@][\w.\-$@]*))\s*(!=|=|:)\s*(?:"((?:[^"\\]|\\.)*)"|([^\s"]+))|(!?)\/((?:\\.|[^/])+)\/([gimsuy]*)|(!?)"([^"]+)"|(\S+)/g;
+
+/**
+ * Filtro local. Términos separados por espacio, todos deben cumplirse:
+ *  - texto suelto o "frase": busca en payload, headers, routing key…
+ *  - /regex/i
+ *  - campo=valor, campo:valor o "campo": valor (como en el JSON), campo!=valor,
+ *    campo=* (existe). Sin punto busca el campo en cualquier nivel; con punto es
+ *    una ruta (pedido.destino, headers.x-retry, properties.message_id).
+ *  - ! adelante de cualquier término lo excluye: !DESTINO=64000000
+ */
+function buildMatcher(raw) {
+  const src = raw.trim();
+  if (!src) return null;
+  const tests = [];
+  for (const m of src.matchAll(TERM)) {
+    let test;
+    let neg;
+    if (m[4]) {
+      neg = m[1] === '!';
+      const value = (m[5] ?? m[6]).replace(/,$/, '');
+      test = fieldTest(m[2] ?? m[3], m[4], value);
+    } else if (m[8]) {
+      neg = m[7] === '!';
+      let re;
+      try {
+        re = new RegExp(m[8], m[9].replace('g', '') || 'i');
+      } catch (err) {
+        return { error: err.message };
+      }
+      test = (it) => re.test(hay(it)._hay);
+    } else {
+      let text = m[11] ?? m[12];
+      neg = (m[10] ?? '') === '!' || (m[12]?.startsWith('!') && m[12].length > 1);
+      if (m[12] && neg) text = text.slice(1);
+      const low = text.toLowerCase();
+      test = (it) => hay(it)._low.includes(low);
+    }
+    tests.push(neg ? (it) => !test(it) : test);
+  }
+  return { test: (it) => tests.every((t) => t(it)) };
 }
 
 function applyFilter({ keepScroll = false } = {}) {
@@ -1255,7 +1336,7 @@ $('publishFile').onclick = async () => {
   const k = chosen.length - already;
   const yes = await ask({
     title: `Publicar ${fmt(already && !k ? chosen.length : k)} ${k === 1 ? 'mensaje' : 'mensajes'} en “${queue}”`,
-    body: `Desde ${S.fileName}${S.picks.file.size ? ' (seleccionados)' : $('filter').value ? ' (los que pasan el filtro)' : ''}.\n\nPersistentes y con content_type application/json, salvo que el elemento traiga sus propias properties. Con confirmación del broker.`,
+    body: `Desde ${S.fileName}${S.picks.file.size ? ' (seleccionados)' : $('filter').value.trim() ? ` (solo los que pasan el filtro: ${$('filter').value.trim()})` : ''}. Lo enviado queda en un respaldo nuevo con solo esos mensajes.\n\nPersistentes y con content_type application/json, salvo que el elemento traiga sus propias properties. Con confirmación del broker.`,
     ok: 'Publicar',
     env: envFor([queue]),
     count: k || chosen.length,

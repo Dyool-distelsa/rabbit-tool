@@ -5,7 +5,8 @@ Herramienta de escritorio liviana (Tauri + Rust) para administrar mensajes de Ra
 ## Qué hace
 
 - **Colas paginadas**: se cargan a mano, de a 5/10/15/20, con las que tienen mensajes primero (o A–Z) y filtro por nombre o `/regex/` que aplica el broker. Nada se trae solo.
-- **Ver (nack)**: lee páginas de mensajes por AMQP (sin tope: 200k o más) y los devuelve a la cola. Lista virtual con filtro local (texto, `/regex/i`, `!excluir`) y detalle con JSON formateado, properties y headers.
+- **Ver (nack)**: lee páginas de mensajes por AMQP (sin tope: 200k o más) y los devuelve a la cola. Lista virtual con detalle de JSON formateado, properties y headers.
+- **Filtro local**: texto, `/regex/i`, `campo=valor` (también `"DESTINO": 64000000` pegado del JSON, en cualquier nivel o por ruta `pedido.destino`), `!excluir`. Al publicar sin selección se envían solo los filtrados.
 - **Ack / Mover**: los primeros N o solo los **seleccionados**. Cada lote se respalda en disco (fsync) antes de cualquier ack, se publica con confirmación del broker (`mandatory`) y recién entonces se ackea en origen. Si algo falla, el mensaje vuelve a la cola.
 - **Mover seleccionados**: reconoce los mensajes elegidos por una huella de su contenido; los no elegidos vuelven a la cola en su orden.
 - **Archivo JSON**: carga un array de mensajes desde un `.json`, se filtra y se publica en una cola.

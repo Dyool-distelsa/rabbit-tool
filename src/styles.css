@@ -1388,11 +1388,11 @@ input[type='checkbox']:not(.switch):checked::after {
 /* Planea de lado a lado sobre el conejo, con un leve vaivén. */
 @keyframes eagle-fly {
   0% { transform: translate(-70px, 0) rotate(4deg); }
-  25% { transform: translate(0, -8px) rotate(0deg); }
-  50% { transform: translate(70px, 0) rotate(-4deg); }
-  75% { transform: translate(0, 6px) rotate(0deg); }
+  25% { transform: translate(0, -14px) rotate(0deg); }
+  50% { transform: translate(70px, -4px) rotate(-4deg); }
+  75% { transform: translate(0, 2px) rotate(0deg); }
   100% { transform: translate(-70px, 0) rotate(4deg); }
 }
 /* Mira hacia donde vuela: la cabeza apunta a la derecha en la ida. */
 @keyframes eagle-face { 0% { transform: scaleX(1); } 50% { transform: scaleX(-1); } }
-.qdig .eagle { margin-bottom: var(--space-2); }
+.qdig .eagle { margin-bottom: 48px; }

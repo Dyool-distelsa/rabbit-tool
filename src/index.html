@@ -149,7 +149,7 @@
           <label class="check" title="Seleccionar / deseleccionar todos los visibles (Ctrl+A)"><input type="checkbox" id="selAll" /></label>
           <div class="search search--grow">
             <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><path d="M3 4.5h14l-5.5 6.5v5l-3-1.5V11L3 4.5Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
-            <input id="filter" placeholder="Filtro local: texto, /regex/i o !excluir — busca en payload, headers y routing key (Ctrl+F)" spellcheck="false" />
+            <input id="filter" placeholder="Filtro: texto, /regex/, campo=valor (&quot;DESTINO&quot;: 64000000), !excluir · varios términos = todos (Ctrl+F)" title="Texto o /regex/ buscan en payload, headers y routing key. campo=valor (o campo:valor, o &quot;campo&quot;: valor como en el JSON) busca el campo en cualquier nivel; con punto es una ruta: pedido.destino, headers.x-retry. campo!=valor, campo=* (existe). ! adelante excluye: !DESTINO=64000000." spellcheck="false" />
             <button class="icon-btn icon-btn--sm" id="clearFilter" title="Limpiar (Esc)" hidden>✕</button>
           </div>
           <span class="sel-pill" id="selCount" hidden></span>
