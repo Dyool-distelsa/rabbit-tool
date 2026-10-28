@@ -842,6 +842,27 @@ async fn backup_path(app: AppHandle) -> R<String> {
     Ok(backup_dir(&app)?.display().to_string())
 }
 
+/// Mensajes ready exactos por AMQP (declare pasivo). Las estadísticas de
+/// management se refrescan cada ~5 s, así que justo después de mover van atrasadas.
+#[tauri::command]
+async fn queues_ready(
+    state: State<'_, AppState>,
+    conn: Conn,
+    names: Vec<String>,
+) -> R<std::collections::HashMap<String, u32>> {
+    let mut out = std::collections::HashMap::new();
+    for name in names {
+        match ready_count(&conn, &state, &name).await {
+            Ok(n) => {
+                out.insert(name, n);
+            }
+            // Una cola borrada no tiene que tirar abajo el resto.
+            Err(err) => log::warn!("queues_ready: {err}"),
+        }
+    }
+    Ok(out)
+}
+
 /// Cierra la conexión AMQP cacheada (al editar o cambiar de perfil).
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> R<()> {
@@ -937,6 +958,7 @@ fn main() {
             republish,
             delete_local,
             backup_path,
+            queues_ready,
             disconnect,
             log_ui,
             log_path,

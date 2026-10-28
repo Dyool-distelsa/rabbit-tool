@@ -238,18 +238,20 @@ async function loadQueues({ page = S.qq.page, silent = false } = {}) {
   S.qq.page = page;
   if (!silent) {
     $('refresh').classList.add('spinning');
-    renderQueueSkeleton();
+    showDig(true);
   }
-  try {
-    let r;
+  const fetchPage = async () => {
     try {
-      r = await call('list_queues', { conn: conn(), q: queueQuery() }, { quiet: silent });
+      return await call('list_queues', { conn: conn(), q: queueQuery() }, { quiet: silent });
     } catch (err) {
       // La página quedó fuera de rango (se borraron colas o cambió el filtro).
       if (S.qq.page === 1) throw err;
       S.qq.page = 1;
-      r = await call('list_queues', { conn: conn(), q: queueQuery() }, { quiet: silent });
+      return call('list_queues', { conn: conn(), q: queueQuery() }, { quiet: silent });
     }
+  };
+  try {
+    const r = silent ? await fetchPage() : await atLeast(fetchPage(), MIN_ANIM_MS);
     S.queues = r.items;
     S.qpage = r;
     if (!S.connected) {
@@ -271,13 +273,52 @@ async function loadQueues({ page = S.qq.page, silent = false } = {}) {
   } finally {
     loadingQueues = false;
     $('refresh').classList.remove('spinning');
+    if (!silent) showDig(false);
   }
 }
 
-function renderQueueSkeleton() {
-  $('qempty').hidden = true;
-  $('queues').classList.remove('anim');
-  $('queues').innerHTML = '<li class="skel"><span class="qname"></span></li>'.repeat(S.qq.size);
+/** Conejo escarbando en el sidebar mientras se buscan colas. */
+function showDig(on) {
+  $('qdig').hidden = !on;
+  if (on) {
+    $('qempty').hidden = true;
+    $('pager').hidden = true;
+    $('queues').classList.remove('anim');
+    $('queues').replaceChildren();
+    const f = $('qfilter').value.trim();
+    $('qdigText').textContent = f ? `Escarbando colas con “${f}”…` : 'Escarbando colas…';
+  }
+}
+
+/**
+ * Espera a `promise` pero no menos de `ms`: con un broker rápido la carga dura
+ * milisegundos y el conejo ni llegaba a verse.
+ */
+const MIN_ANIM_MS = 900;
+async function atLeast(promise, ms) {
+  const [r] = await Promise.all([promise, new Promise((res) => setTimeout(res, ms))]);
+  return r;
+}
+
+/**
+ * Pide los ready exactos (AMQP) de las colas tocadas y los aplica en la lista:
+ * las estadísticas de management llegan con ~5 s de atraso.
+ */
+async function refreshExact(names) {
+  names = [...new Set(names.filter(Boolean))];
+  if (!names.length) return;
+  try {
+    const ready = await call('queues_ready', { conn: conn(), names }, { quiet: true });
+    for (const [name, n] of Object.entries(ready)) {
+      const q = S.queues.find((x) => x.name === name);
+      if (q) {
+        q.messages = n + (q.unacked || 0);
+        q.ready = n;
+      }
+      if (name === S.current) S.currentInfo = { ...(S.currentInfo || { name, unacked: 0 }), ready: n };
+    }
+    renderQueues();
+  } catch {}
 }
 
 const fmt = (n) => Number(n || 0).toLocaleString('es');
@@ -679,8 +720,9 @@ async function peek() {
   startOp(`Descargando hasta ${fmt(n)} mensajes de ${queue}…`, n, { mode: 'run' });
   showSkeleton(true, `Descargando mensajes de ${queue}…`);
   try {
-    const r = await call('peek', { conn: conn(), queue, count: n });
+    const r = await atLeast(call('peek', { conn: conn(), queue, count: n }), MIN_ANIM_MS);
     if (token !== S.peekToken || queue !== S.current) return;
+    refreshExact([queue]);
     S.qItems = r.map(normQueueMsg);
     S.sel = S.qItems.length ? 0 : -1;
     if (S.tab === 'queue') applyFilter();
@@ -709,18 +751,36 @@ function showSkeleton(on, text = 'Cargando…') {
 async function drain(target) {
   if (!S.current || S.op) return;
   const source = S.current;
-  const n = count();
+  const asked = count();
+
+  // Cantidad real: lo pedido acotado a lo que hay ready ahora (AMQP, sin el atraso
+  // de las estadísticas). Así el diálogo no promete mover 100 si hay 5.
+  let ready;
+  try {
+    const names = target ? [source, target] : [source];
+    const exact = await busy($(target ? 'move' : 'ack'), () => call('queues_ready', { conn: conn(), names }));
+    if (target && !(target in exact)) return toast.err(`La cola destino “${target}” no existe o no es accesible`);
+    if (!(source in exact)) return toast.err(`No se pudo leer “${source}”`);
+    ready = exact[source];
+    refreshExact(names);
+  } catch (err) {
+    return toast.err(`No se pudo consultar la cola: ${err}`);
+  }
+  if (!ready) return toast.info(`“${source}” no tiene mensajes ready`);
+  const n = Math.min(asked, ready);
+  const note = asked > ready ? `\nPediste ${fmt(asked)}, pero la cola tiene ${fmt(ready)} ready.` : `\nLa cola tiene ${fmt(ready)} ready.`;
+
   const yes = await ask(
     target
-      ? { title: `Mover ${fmt(n)} mensajes`, body: `De “${source}” a “${target}”.\n\nCada lote se respalda localmente, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover' }
-      : { title: `Ack de ${fmt(n)} mensajes`, body: `Se sacan de “${source}”.\n\nQuedan respaldados localmente y se pueden re-publicar desde “Respaldo local”.`, ok: 'Sacar mensajes', danger: true }
+      ? { title: `Mover ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `De “${source}” a “${target}”.${note}\n\nCada lote se respalda localmente, se publica con confirmación del broker y recién ahí se ackea en origen.`, ok: 'Mover' }
+      : { title: `Ack de ${fmt(n)} ${n === 1 ? 'mensaje' : 'mensajes'}`, body: `Se sacan de “${source}”.${note}\n\nQuedan respaldados localmente y se pueden re-publicar desde “Respaldo local”.`, ok: 'Sacar mensajes', danger: true }
   );
   if (!yes) return;
 
   startOp(target ? `Moviendo ${source} → ${target}` : `Ackeando ${source}`, n, { cancellable: true, mode: 'run' });
   showSkeleton(true, target ? `Moviendo mensajes a ${target}…` : `Sacando mensajes de ${source}…`);
   try {
-    const r = await call('drain', { conn: conn(), source, target: target || null, count: n });
+    const r = await atLeast(call('drain', { conn: conn(), source, target: target || null, count: n }), MIN_ANIM_MS);
     const verb = target ? 'movidos' : 'ackeados';
     if (r.total === 0) toast.info(`“${source}” no tiene mensajes ready`);
     else if (r.failed.length) toast.err(`${fmt(r.ok)} ${verb}, falló: ${r.failed[0]}. Los fallidos siguen en origen.`);
@@ -736,10 +796,11 @@ async function drain(target) {
     showSkeleton(false);
     endOp();
   }
-  // Lo leído ya no refleja la cola; solo se refresca la página de colas ya cargada.
+  // Lo leído ya no refleja la cola. Los contadores de origen y destino se toman
+  // exactos por AMQP; un refresco completo de la página corregiría con datos viejos.
   S.qItems = [];
   applyFilter();
-  if (S.qpage) loadQueues({ silent: true });
+  refreshExact([source, target]);
   refreshLocalCount();
 }
 
@@ -806,7 +867,7 @@ $('republishSel').onclick = async () => {
     endOp();
   }
   loadLocal();
-  if (S.qpage) loadQueues({ silent: true });
+  refreshExact([queue]);
 };
 
 $('deleteSel').onclick = async () => {

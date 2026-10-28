@@ -72,6 +72,8 @@
   --bunny-inner: #7f95c8;
   --bunny-tail: #c9d6ee;
   --bunny-eye: #f4f7fc;
+  --dirt: #9a6a3c;
+  --dirt-dark: #3a2616;
   color-scheme: dark;
 }
 
@@ -106,10 +108,12 @@
   color-scheme: light;
 }
 
+/* Con las animaciones de Windows apagadas, WebView2 reporta reduced-motion. Se
+   respeta en toda la UI menos en los conejos: son el indicador de "trabajando". */
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash),
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash)::before,
+  :not(.bunny, .bunny *, .runner, .runway, .bunny-dash)::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     animation-delay: 0s !important;
@@ -853,6 +857,59 @@ input[type='checkbox']:not(.switch):checked::after {
   0% { transform: translateX(-3px); opacity: 0.9; }
   100% { transform: translateX(6px); opacity: 0; }
 }
+
+/* Escarbando: cuerpo inclinado hacia el agujero, pata rascando, tierra que
+   sale volando hacia atrás y un montículo que crece. */
+.bunny .b-hole, .bunny .b-mound, .bunny .b-dirt { display: none; }
+.bunny--dig .b-hole { display: inline; fill: var(--dirt-dark); }
+.bunny--dig .b-mound { display: inline; fill: var(--dirt); transform-box: fill-box; transform-origin: 50% 100%; animation: b-mound 2.8s ease-out infinite; }
+.bunny--dig .b-dirt { display: inline; fill: var(--dirt); }
+.bunny--dig .b-dirt circle { transform-box: fill-box; transform-origin: center; animation: b-fling 0.75s cubic-bezier(0.3, 0.6, 0.6, 1) infinite; opacity: 0; }
+.bunny--dig .b-dirt circle:nth-child(2) { animation-delay: 0.15s; animation-duration: 0.7s; }
+.bunny--dig .b-dirt circle:nth-child(3) { animation-delay: 0.3s; animation-duration: 0.8s; }
+.bunny--dig .b-dirt circle:nth-child(4) { animation-delay: 0.45s; animation-duration: 0.65s; }
+.bunny--dig .b-dirt circle:nth-child(5) { animation-delay: 0.6s; animation-duration: 0.75s; }
+.bunny--dig .b-all { transform-origin: 46px 58px; animation: b-dig 0.24s ease-in-out infinite alternate; }
+.bunny--dig .b-paw { transform-box: fill-box; transform-origin: center; animation: b-scratch 0.12s linear infinite alternate; }
+.bunny--dig .b-ear-f, .bunny--dig .b-ear-b { animation: b-ear-dig 0.48s ease-in-out infinite alternate; }
+.bunny--dig .b-shadow { opacity: 0.1; }
+
+@keyframes b-dig {
+  from { transform: rotate(-16deg) translateY(1px); }
+  to { transform: rotate(-21deg) translateY(3px); }
+}
+@keyframes b-scratch {
+  from { transform: translate(-3px, 0) rotate(-12deg); }
+  to { transform: translate(3px, 1px) rotate(10deg); }
+}
+@keyframes b-ear-dig {
+  from { transform: rotate(-6deg); }
+  to { transform: rotate(8deg); }
+}
+/* Arco hacia atrás por encima del lomo y cae sobre el montículo. */
+@keyframes b-fling {
+  0% { transform: translate(0, 0) scale(0.5); opacity: 0; }
+  12% { opacity: 1; }
+  45% { transform: translate(22px, -26px) scale(1); opacity: 1; }
+  100% { transform: translate(46px, -2px) scale(0.8); opacity: 0; }
+}
+@keyframes b-mound {
+  0% { transform: scaleY(0.55); }
+  100% { transform: scaleY(1.15); }
+}
+
+.qdig {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  color: var(--color-text-dim);
+  font-size: var(--text-sm);
+  animation: fade-in var(--motion-duration-base) var(--motion-ease-decelerate);
+}
+.qdig p { margin: 0; }
 
 /* Pista del overlay de descarga: el conejo la cruza corriendo en loop. */
 .runway {
