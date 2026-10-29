@@ -49,3 +49,10 @@ export function worstEnv(names) {
   }
   return best && { level: best.level, name: best.name };
 }
+
+/** El más riesgoso de dos resultados de `worstEnv` (cualquiera puede ser null). */
+export function worseEnv(a, b) {
+  if (!a || !b) return a || b || null;
+  const rank = (x) => LEVELS.findIndex(([l]) => l === x.level);
+  return rank(b) < rank(a) ? b : a;
+}

@@ -7,6 +7,9 @@
  *
  * Las animaciones del conejo ignoran prefers-reduced-motion a propósito: son la
  * señal de "estoy trabajando" de la app (ver styles.css).
+ *
+ * Accesorios según el ambiente del perfil (`html[data-env]`): DEV gorra con
+ * hélice, QA lentes y lupa, PROD sirena de policía y gotita de sudor.
  */
 /** Partes del conejo (viewBox 0 0 64 64), reutilizadas por la escena del aviso. */
 const SHAPES = `
@@ -27,6 +30,31 @@ const SHAPES = `
     <ellipse class="b-paw" cx="22" cy="54.6" rx="5.6" ry="2.9"/>
     <ellipse class="b-eye" cx="18" cy="29" rx="1.9" ry="2.2"/>
     <circle class="b-nose" cx="12" cy="32.8" r="1.4"/>
+    <g class="b-acc b-cap">
+      <path class="b-cap__dome" d="M11.8 27.5Q12.5 17.6 22 17.6Q31.2 17.6 32.3 27.5Q22 24.6 11.8 27.5Z"/>
+      <path class="b-cap__stripe" d="M19.4 17.9Q22 17.5 24.6 17.9L25.1 25.3Q22 25 18.9 25.3Z"/>
+      <path class="b-cap__brim" d="M12.8 26.4Q6.4 26 4.4 28.5Q9.2 29.8 14.2 28.2Z"/>
+      <path class="b-cap__stick" d="M22 17.8V13.8"/>
+      <ellipse class="b-cap__prop" cx="22" cy="13.2" rx="6.2" ry="1.5"/>
+      <circle class="b-cap__hub" cx="22" cy="13.2" r="1.1"/>
+    </g>
+    <g class="b-acc b-qa">
+      <path class="b-qa__frame" d="M14.4 29.2H13.4M21.6 28.4L28.4 26.8"/>
+      <circle class="b-qa__lens b-qa__frame" cx="18" cy="29" r="3.6"/>
+      <circle class="b-qa__lens b-qa__frame" cx="11.2" cy="29.4" r="2.2"/>
+      <g class="b-qa__glass">
+        <path class="b-qa__handle" d="M17 52L12.2 46.8"/>
+        <circle class="b-qa__lens b-qa__ring" cx="8.6" cy="42.8" r="5"/>
+        <path class="b-qa__glint" d="M5.6 41.6Q6 39.6 8 39.2"/>
+      </g>
+    </g>
+    <g class="b-acc b-siren">
+      <g class="b-siren__rays"><path d="M14.2 10.6L10.8 7.6M13 15.4L9 15.2M29.8 10.6L33.2 7.6M31 15.4L35 15.2"/></g>
+      <path class="b-siren__dome" d="M17 19Q17 8.8 22 8.8Q27 8.8 27 19Z"/>
+      <ellipse class="b-siren__glint" cx="19.7" cy="13.4" rx="1.2" ry="2.8"/>
+      <rect class="b-siren__base" x="15.4" y="18.4" width="13.2" height="3.6" rx="1.1"/>
+    </g>
+    <path class="b-acc b-sweat" d="M31 20.6Q33.2 24.2 31 25.5Q28.8 24.2 31 20.6Z"/>
   </g>
   <path class="b-rim" d="M-12 68 Q-9 53.8 12 54.4 Q34 53.8 42 68 Z"/>`;
 const SVG = `<svg class="bunny__svg" viewBox="0 0 64 64" aria-hidden="true">${SHAPES}</svg>`;

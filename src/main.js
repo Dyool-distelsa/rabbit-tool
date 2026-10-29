@@ -2,7 +2,7 @@ import { mountToastContainer } from './toast.js';
 import { createVirtualList } from './vlist.js';
 import { renderJson } from './highlight.js';
 import { mountBunnies, setBunnyMode, bunnyDash, bunny, eagle, terrorScene, terrorLevel, TERROR_TEXT } from './bunny.js';
-import { worstEnv, ENV_INFO } from './env.js';
+import { worstEnv, worseEnv, ENV_INFO } from './env.js';
 import { renderHelp } from './help.js';
 
 mountBunnies();
@@ -30,6 +30,11 @@ const store = {
   set(k, v) {
     try {
       localStorage.setItem(k, JSON.stringify(v));
+    } catch {}
+  },
+  del(k) {
+    try {
+      localStorage.removeItem(k);
     } catch {}
   },
 };
@@ -170,22 +175,125 @@ function conn() {
 function renderProfiles() {
   $('profile').innerHTML = '';
   for (const p of profiles) $('profile').add(new Option(p.name, p.name, false, p.name === profileName));
+  applyEnv();
 }
 
-const PROFILE_FIELDS = ['name', 'api', 'amqp', 'user', 'pass', 'vhost'];
+// --- ambiente del perfil ------------------------------------------------------------
+/**
+ * Ambiente de un perfil: el elegido a mano o, en Auto, el que sugieren su nombre,
+ * vhost y host (p. ej. "rabbit-prd.empresa.com"). { level, name, manual } o null.
+ */
+function profileEnv(p = profile()) {
+  if (!p) return null;
+  if (p.env) return { level: p.env, name: `perfil ${p.name}`, manual: true };
+  return worstEnv([p.name, p.vhost, (p.api || '').replace(/^https?:\/\//, '')]);
+}
+
+const ENV_SHORT = { prod: 'PROD', qa: 'QA', dev: 'DEV' };
+let shownEnv = null; // lo último mandado a la ventana (título e icono)
+
+/**
+ * Pinta el ambiente del perfil elegido: `html[data-env]` viste a los conejos y
+ * colorea la franja y el scroll; la etiqueta junto al selector; título e icono
+ * de la barra de tareas.
+ */
+function applyEnv() {
+  const p = profile();
+  const env = profileEnv(p);
+  const level = env?.level ?? '';
+  if (level) document.documentElement.dataset.env = level;
+  else delete document.documentElement.dataset.env;
+  const tag = $('envTag');
+  tag.hidden = !level;
+  if (level) {
+    tag.textContent = ENV_SHORT[level];
+    tag.className = `env-tag env-tag--${level}`;
+    tag.title = `${ENV_INFO[level].title} — ${env.manual ? 'elegido en el perfil' : `detectado por “${env.name}”`}. Se cambia en el lápiz.`;
+  }
+  const key = `${level}|${p?.name ?? ''}`;
+  if (key !== shownEnv) {
+    shownEnv = key;
+    call('set_env_indicator', { env: level || null, profile: p?.name ?? '' }, { quiet: true }).catch((err) => log('warn', `set_env_indicator: ${err}`));
+  }
+}
+
+const PROFILE_FIELDS = ['name', 'env', 'api', 'amqp', 'user', 'pass', 'vhost'];
 // Resultado de "Probar conexión" para los valores exactos del formulario.
 let lastTest = null; // { key, ok }
+// Perfil que se está editando en el diálogo; null = perfil nuevo.
+let editing = null;
+let deleteArmed = null; // timer del "tocá de nuevo para borrar"
 
-function openConnDialog() {
-  const form = $('connDialog').querySelector('form');
-  const p = profile() || { name: '', ...DEFAULTS };
-  for (const f of PROFILE_FIELDS) form.elements[f].value = p[f] ?? '';
-  form.elements.pass.value = secrets[p.name] ?? p.pass ?? '';
-  $('connDelete').hidden = profiles.length < 2;
-  $('connTest').hidden = true;
-  lastTest = null;
-  $('connDialog').showModal();
+/** "qa" → "qa (copia)", "qa (copia 2)"… el primero que no exista. */
+function freeName(base) {
+  const taken = new Set(profiles.map((p) => p.name.toLowerCase()));
+  for (let i = 1; ; i++) {
+    const n = i === 1 ? `${base} (copia)` : `${base} (copia ${i})`;
+    if (!taken.has(n.toLowerCase())) return n;
+  }
 }
+
+/** Pone el diálogo en modo "nuevo" o "editar" (título, botones, validación del nombre). */
+function setConnMode(name) {
+  editing = name;
+  $('connTitle').textContent = name == null ? 'Nuevo perfil' : 'Editar perfil';
+  $('connDelete').hidden = name == null || profiles.length < 2;
+  $('connCopy').hidden = name == null;
+  disarmDelete();
+  checkProfileName();
+}
+
+/** `mode`: 'edit' (el perfil elegido) o 'new' (vacío). */
+function openConnDialog(mode = 'edit') {
+  const form = $('connDialog').querySelector('form');
+  const cur = profile();
+  const p = mode === 'new' || !cur ? { name: '', env: '', api: '', amqp: '', user: '', vhost: '/' } : cur;
+  for (const f of PROFILE_FIELDS) form.elements[f].value = p[f] ?? '';
+  form.elements.pass.value = mode === 'new' ? '' : (secrets[p.name] ?? p.pass ?? '');
+  setConnMode(mode === 'new' || !cur ? null : p.name);
+  $('connTest').hidden = true;
+  showEnvHint();
+  lastTest = null;
+  // Sin esto, cerrar con Esc repetiría el "save" de la vez anterior.
+  $('connDialog').returnValue = '';
+  $('connDialog').showModal();
+  if (mode === 'new') form.elements.name.focus();
+}
+
+// El Administrador de credenciales no distingue mayúsculas: "qa" y "QA" serían la misma.
+const sameName = (a, b) => a?.toLowerCase() === b?.toLowerCase();
+
+/** El nombre identifica al perfil (y a su contraseña guardada): no se puede repetir. */
+function checkProfileName() {
+  const input = $('connDialog').querySelector('form').elements.name;
+  const n = input.value.trim();
+  const taken = n && !sameName(n, editing) && profiles.some((p) => sameName(p.name, n));
+  input.setCustomValidity(taken ? `Ya existe un perfil “${n}”` : '');
+}
+$('connDialog').querySelector('form').elements.name.addEventListener('input', checkProfileName);
+
+/** Debajo de "Ambiente": qué se va a mostrar con lo que hay escrito en el formulario. */
+function showEnvHint() {
+  const f = $('connDialog').querySelector('form').elements;
+  const env = profileEnv(Object.fromEntries(PROFILE_FIELDS.map((k) => [k, f[k].value.trim()])));
+  const el = $('connEnvHint');
+  el.className = `hint env-hint${env ? ` env-hint--${env.level}` : ''}`;
+  el.textContent = !env
+    ? 'Auto: no se reconoce ningún ambiente en el nombre, vhost ni host. Elegilo a mano si es PROD o QA.'
+    : env.manual
+      ? `Se va a mostrar como ${ENV_INFO[env.level].title}.`
+      : `Auto: ${ENV_INFO[env.level].title}, detectado por “${env.name}”.`;
+}
+for (const k of ['name', 'env', 'api', 'vhost']) $('connDialog').querySelector('form').elements[k].addEventListener('input', showEnvHint);
+
+// Duplicar: los mismos datos (contraseña incluida) pasan a ser un perfil nuevo.
+$('connCopy').onclick = () => {
+  const name = $('connDialog').querySelector('form').elements.name;
+  name.value = freeName(name.value.trim() || editing || 'perfil');
+  setConnMode(null);
+  name.focus();
+  name.select();
+};
 
 /** Valores del formulario normalizados (AMQP vacío o en 15672 → host de la API:5672). */
 function formProfile({ announce = false } = {}) {
@@ -239,21 +347,44 @@ $('connDialog').addEventListener('close', () => {
   // La contraseña va al almacén del sistema; el perfil en localStorage queda sin ella.
   const { pass, ...stored } = p;
   saveSecret(p.name, pass);
-  const i = profiles.findIndex((x) => x.name === p.name);
+  const i = editing == null ? -1 : profiles.findIndex((x) => x.name === editing);
   if (i >= 0) profiles[i] = stored;
   else profiles.push(stored);
+  const renamed = i >= 0 && editing !== p.name ? editing : null;
+  // Solo cambió mayúsculas: es la misma credencial, borrarla perdería la recién guardada.
+  if (renamed && sameName(renamed, p.name)) delete secrets[renamed];
+  else if (renamed) forgetSecret(renamed);
   selectProfile(p.name);
-  toast.ok(`Perfil “${p.name}” guardado`);
+  toast.ok(i < 0 ? `Perfil “${p.name}” creado` : renamed ? `Perfil “${renamed}” renombrado a “${p.name}”` : `Perfil “${p.name}” guardado`);
   if (tested) connect();
 });
 
+function forgetSecret(name) {
+  delete secrets[name];
+  call('secret_delete', { profile: name }, { quiet: true }).catch((err) => log('warn', `secret_delete ${name}: ${err}`));
+}
+
+function disarmDelete() {
+  clearTimeout(deleteArmed);
+  deleteArmed = null;
+  $('connDelete').textContent = 'Borrar perfil';
+}
+
+// Borrar pide un segundo toque: no hay forma de deshacerlo (la contraseña se va del almacén).
 $('connDelete').onclick = () => {
-  const gone = profileName;
+  const gone = editing;
+  if (gone == null) return;
+  if (!deleteArmed) {
+    $('connDelete').textContent = `¿Borrar “${gone}”? Tocá de nuevo`;
+    deleteArmed = setTimeout(disarmDelete, 4000);
+    return;
+  }
+  disarmDelete();
   profiles = profiles.filter((p) => p.name !== gone);
-  delete secrets[gone];
-  call('secret_delete', { profile: gone }, { quiet: true }).catch((err) => log('warn', `secret_delete ${gone}: ${err}`));
+  forgetSecret(gone);
   $('connDialog').close();
-  selectProfile(profiles[0].name);
+  selectProfile(profileName === gone ? profiles[0].name : profileName);
+  toast.info(`Perfil “${gone}” borrado`);
 };
 
 /** Cambiar o editar el perfil siempre desconecta: vuelve a habilitar "Conectar". */
@@ -992,14 +1123,54 @@ function lastOp(text) {
 }
 
 // --- actividad: trazabilidad de las operaciones principales ------------------------
-// Las últimas ACT_MAX quedan en la barra izquierda (sobreviven a reinicios) y las
-// más viejas se descartan. Cada una va también al log, que rota solo: ahí queda
-// el historial completo.
-const ACT_MAX = 25;
+// Las últimas ACT_MAX quedan en la barra izquierda y en activity.json (junto a los
+// respaldos), así sobreviven a reinicios y actualizaciones; las más viejas se
+// descartan. Cada una va también al log, que rota solo: ahí queda el historial completo.
+const ACT_MAX = 200;
+const SESSION_START = Date.now();
 const ACT_LABEL = { nack: 'nack', ack: 'ack', move: 'traslado', publish: 'carga', republish: 're-publicar', download: 'descarga', export: 'exportar', delete: 'borrado' };
 const ACT_OUTCOME = { cancelled: 'cancelado', partial: 'parcial', stalled: 'incompleto', error: 'error' };
-let acts = store.get('activity', []);
-if (!Array.isArray(acts)) acts = [];
+let acts = [];
+// Dónde se guarda: 'pending' hasta leer el archivo (no pisarlo con una lista a medias),
+// 'disk' normalmente, 'local' si no se pudo leer (queda en el localStorage esta sesión).
+let actStore = 'pending';
+let actSaving = Promise.resolve();
+
+function saveActs() {
+  if (actStore === 'local') return store.set('activity', acts);
+  if (actStore !== 'disk') return;
+  const items = acts;
+  actSaving = actSaving
+    .then(() => call('activity_save', { items }, { quiet: true }))
+    .catch((err) => log('warn', `no se pudo guardar la actividad: ${err}`));
+  return actSaving;
+}
+
+/** Lee activity.json; la primera vez migra la que estaba en el localStorage. */
+async function loadActs() {
+  const legacy = store.get('activity', null);
+  let saved;
+  try {
+    saved = await call('activity_load', undefined, { quiet: true });
+  } catch (err) {
+    log('warn', `no se pudo leer la actividad guardada: ${err}`);
+    actStore = 'local';
+    saved = Array.isArray(legacy) ? legacy : [];
+  }
+  const fromDisk = Array.isArray(saved);
+  const old = fromDisk ? saved : Array.isArray(legacy) ? legacy : [];
+  // Lo registrado mientras se leía el archivo va arriba de lo guardado.
+  acts = [...acts, ...old].sort((a, b) => b.ts - a.ts).slice(0, ACT_MAX);
+  if (actStore === 'pending') {
+    actStore = 'disk';
+    if (!fromDisk || acts.length !== old.length) await saveActs();
+    if (legacy) {
+      store.del('activity');
+      if (!fromDisk) log('info', `actividad migrada del localStorage a disco (${old.length})`);
+    }
+  }
+  renderActivity();
+}
 
 /** Resultado de un envío del backend → ok / partial / error / cancelled / stalled. */
 const outcomeOf = (r) =>
@@ -1030,9 +1201,9 @@ function actParts(a) {
  */
 function activity(a) {
   const entry = { ts: Date.now(), outcome: 'ok', profile: profile()?.name ?? '', ...a };
-  entry.env = worstEnv([entry.source, entry.target, entry.profile])?.level ?? null;
+  entry.env = worseEnv(worstEnv([entry.source, entry.target]), profileEnv())?.level ?? null;
   acts = [entry, ...acts].slice(0, ACT_MAX);
-  store.set('activity', acts);
+  saveActs();
   const text = actParts(entry).map((p) => (typeof p === 'string' ? p : `'${p.q}'`)).join('');
   const extra = [ACT_OUTCOME[entry.outcome], entry.note, entry.profile && `perfil ${entry.profile}`, entry.backup && `respaldo ${entry.backup}`];
   log(entry.outcome === 'error' ? 'error' : 'info', `actividad ${ACT_LABEL[entry.op] ?? entry.op}: ${text}${extra.filter(Boolean).map((x) => ` · ${x}`).join('')}`);
@@ -1044,7 +1215,12 @@ function renderActivity(fresh = false) {
   const today = new Date().toDateString();
   const node = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text ?? '' });
   const frag = document.createDocumentFragment();
+  let older = false;
   acts.forEach((a, i) => {
+    if (!older && a.ts < SESSION_START) {
+      older = true;
+      frag.appendChild(node('li', 'act-sep', 'Sesiones anteriores'));
+    }
     const li = node('li', `act${a.env ? ` act--${a.env}` : ''}${fresh && i === 0 ? ' fresh' : ''}`);
     if (a.backup) {
       li.dataset.backup = a.backup;
@@ -1081,12 +1257,13 @@ $('activityToggle').onclick = () => {
 };
 $('activityClear').onclick = () => {
   acts = [];
-  store.set('activity', acts);
+  saveActs();
   log('info', 'actividad: lista limpiada (el historial sigue en este log)');
   renderActivity();
 };
 $('activity').classList.toggle('collapsed', !!store.get('activityCollapsed', false));
 renderActivity();
+loadActs();
 
 // --- confirmación -----------------------------------------------------------------
 /**
@@ -1094,7 +1271,7 @@ renderActivity();
  * extra). `confirm` es la cola que hay que escribir en PROD.
  */
 function envFor(queues, confirm) {
-  const env = worstEnv([...queues, profile()?.name, conn().vhost]);
+  const env = worseEnv(worstEnv(queues), profileEnv());
   return env && { ...env, confirm: confirm ?? queues.find(Boolean) };
 }
 
@@ -1922,36 +2099,81 @@ function setTab(t) {
 }
 for (const b of document.querySelectorAll('.tab')) b.onclick = () => setTab(b.dataset.tab);
 
-// --- splitter del detalle -------------------------------------------------------------
-{
-  const sp = $('splitter');
-  const detail = $('detail');
-  const saved = store.get('detailWidth', null);
-  if (saved) detail.style.width = `${saved}px`;
-  const clamp = (w) => Math.max(280, Math.min(w, $('detail').parentElement.clientWidth - 300));
+// --- paneles ajustables ---------------------------------------------------------------
+/**
+ * Divisor arrastrable: cambia el ancho (axis 'x') o el alto ('y') de `target` y lo
+ * recuerda en `key`. `dir` = 1 si el panel crece hacia donde se arrastra
+ * (derecha/abajo), -1 si al revés. Flechas lo ajustan (Shift = más) y doble clic
+ * vuelve al tamaño del CSS. Devuelve una función que lo re-acomoda a la ventana.
+ */
+function makeSplitter(sp, target, { axis, dir, key, min, max }) {
+  const prop = axis === 'x' ? 'width' : 'height';
+  const pos = (ev) => (axis === 'x' ? ev.clientX : ev.clientY);
+  const size = () => (axis === 'x' ? target.offsetWidth : target.offsetHeight);
+  const clamp = (v) => Math.round(Math.max(min, Math.min(v, max())));
+  const set = (v) => {
+    target.style[prop] = `${clamp(v)}px`;
+    target.classList.add('sized');
+  };
+  const save = () => store.set(key, size());
+  const saved = store.get(key, null);
+  if (saved) set(saved);
+
   sp.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
     sp.setPointerCapture(ev.pointerId);
     sp.classList.add('dragging');
-    const startX = ev.clientX;
-    const startW = detail.offsetWidth;
-    const move = (e) => (detail.style.width = `${clamp(startW - (e.clientX - startX))}px`);
-    const up = () => {
-      sp.classList.remove('dragging');
-      sp.removeEventListener('pointermove', move);
-      store.set('detailWidth', detail.offsetWidth);
-    };
+    document.body.classList.add(`resizing-${axis}`);
+    const start = pos(ev);
+    const startSize = size();
+    const move = (e) => set(startSize + dir * (pos(e) - start));
     sp.addEventListener('pointermove', move);
-    sp.addEventListener('pointerup', up, { once: true });
+    sp.addEventListener(
+      'lostpointercapture',
+      () => {
+        sp.classList.remove('dragging');
+        document.body.classList.remove(`resizing-${axis}`);
+        sp.removeEventListener('pointermove', move);
+        save();
+      },
+      { once: true }
+    );
   });
   sp.addEventListener('dblclick', () => {
-    detail.style.width = '';
-    store.set('detailWidth', null);
+    target.style[prop] = '';
+    target.classList.remove('sized');
+    store.set(key, null);
   });
+  const [less, more] = axis === 'x' ? ['ArrowLeft', 'ArrowRight'] : ['ArrowUp', 'ArrowDown'];
   sp.addEventListener('keydown', (ev) => {
-    const step = ev.shiftKey ? 64 : 16;
-    if (ev.key === 'ArrowLeft') detail.style.width = `${clamp(detail.offsetWidth + step)}px`;
-    else if (ev.key === 'ArrowRight') detail.style.width = `${clamp(detail.offsetWidth - step)}px`;
+    if (ev.key !== less && ev.key !== more) return;
+    ev.preventDefault();
+    const step = (ev.shiftKey ? 64 : 16) * dir * (ev.key === more ? 1 : -1);
+    set(size() + step);
+    save();
   });
+  return () => {
+    if (target.classList.contains('sized')) set(size());
+  };
+}
+
+{
+  const refit = [
+    // Barra izquierda: la parte principal necesita lugar para la lista y el detalle.
+    makeSplitter($('sideSplitter'), document.querySelector('.sidebar'), {
+      axis: 'x', dir: 1, key: 'sidebarWidth', min: 220, max: () => Math.min(640, window.innerWidth - 600),
+    }),
+    // Detalle del mensaje: crece hacia la izquierda.
+    makeSplitter($('splitter'), $('detail'), {
+      axis: 'x', dir: -1, key: 'detailWidth', min: 280, max: () => $('detail').parentElement.clientWidth - 300,
+    }),
+    // Actividad: crece hacia arriba, dejando lugar a las colas.
+    makeSplitter($('activitySplitter'), $('activity'), {
+      axis: 'y', dir: -1, key: 'activityHeight', min: 90, max: () => document.querySelector('.sidebar').clientHeight - 180,
+    }),
+  ];
+  window.addEventListener('resize', () => refit.forEach((f) => f()));
 }
 
 // --- tema ---------------------------------------------------------------------------
@@ -1961,6 +2183,25 @@ function applyTheme(t) {
 }
 applyTheme(store.get('theme', 'dark'));
 $('theme').onclick = () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+
+// --- en PROD el conejo no quiere mirar -------------------------------------------------
+// Al pasar por una acción que saca, publica o borra mensajes en PROD, los conejos
+// se tapan los ojos con la oreja. Mira las colas que tocaría cada botón y el perfil.
+{
+  const touches = {
+    ack: () => [S.current],
+    move: () => [S.current, $('target').value.trim()],
+    publishFile: () => [$('fileTarget').value.trim()],
+    republishSel: () => [S.backupMeta?.source],
+    deleteSel: () => [S.backupMeta?.source],
+    deleteRun: () => [S.backupMeta?.source],
+  };
+  const root = document.documentElement;
+  for (const [id, queues] of Object.entries(touches)) {
+    $(id).addEventListener('pointerenter', () => root.classList.toggle('scared', envFor(queues().filter(Boolean))?.level === 'prod'));
+    $(id).addEventListener('pointerleave', () => root.classList.remove('scared'));
+  }
+}
 
 // --- teclado ------------------------------------------------------------------------
 document.addEventListener('keydown', (ev) => {
@@ -1998,7 +2239,8 @@ document.addEventListener('keydown', (ev) => {
 
 // --- arranque -----------------------------------------------------------------------
 $('connect').onclick = connect;
-$('editConn').onclick = openConnDialog;
+$('editConn').onclick = () => openConnDialog('edit');
+$('newConn').onclick = () => openConnDialog('new');
 $('profile').onchange = () => selectProfile($('profile').value);
 // Colas: nada se trae solo. Cargar / Enter / paginar / cambiar orden o tamaño son
 // acciones explícitas, y siempre piden una sola página al broker.

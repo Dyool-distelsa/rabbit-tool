@@ -103,14 +103,16 @@ export async function renderHelp(container, { invoke, notify, paths }) {
   const how = section('Cómo se usa');
   how.appendChild(
     steps([
-      ['Elegí o creá un perfil (lápiz), probá la conexión y ', code('Conectar'), '.'],
+      ['Elegí un perfil o creá uno nuevo con ', code('+'), ' (el lápiz edita, renombra, duplica o borra el elegido), probá la conexión y ', code('Conectar'), '.'],
       ['Las colas no se cargan solas: filtrá por nombre o ', code('/regex/'), ' y tocá ', code('Cargar'), ' (de a 5–20, con mensajes primero o A–Z).'],
       [code('Ver (nack)'), ' lee una página de mensajes y los devuelve a la cola. El filtro local busca en payload, headers y routing key.'],
       ['Marcá mensajes (o “toda la cola”) y usá ', code('Ack'), ' o ', code('Mover →'), '. Sin selección actúan sobre los primeros N.'],
       [code('Descargar JSON…'), ' guarda N mensajes (o toda la cola) directo en un .json, sin ack: vuelven a la cola. ', code('Exportar JSON…'), ' (junto al filtro) guarda los seleccionados o filtrados de cualquier pestaña.'],
       ['Pestaña ', code('Archivo JSON'), ': cargá un array de mensajes (por ejemplo uno descargado y editado), filtrá y publicá en una cola.'],
       ['Pestaña ', code('Respaldos'), ': cada envío queda guardado; podés abrir cualquiera y volver a cargar sus mensajes.'],
-      [code('Actividad'), ' (abajo a la izquierda): las últimas 25 operaciones con hora, la más reciente arriba; el borde marca el ambiente. Tocar una abre su respaldo. El historial completo queda en el log.'],
+      [code('Actividad'), ' (abajo a la izquierda): las últimas 200 operaciones con hora, la más reciente arriba; se guardan en disco y siguen ahí al volver a abrir la app. El borde marca el ambiente y tocar una abre su respaldo. El historial completo queda en el log.'],
+      ['El ambiente del perfil se ve siempre: el conejo usa gorra con hélice en DEV, lentes y lupa en QA y sirena en PROD (y se tapa los ojos si pasás por Ack o Mover). También lo marcan la etiqueta junto al perfil, la franja de arriba, el color del scroll y el título de la ventana. Se elige en el lápiz (', code('Ambiente'), '); en Auto se deduce del nombre, vhost o host.'],
+      ['Los paneles se ajustan arrastrando sus bordes (ancho de la barra izquierda, alto de la actividad, ancho del detalle) o con las flechas; doble clic vuelve al tamaño original. Se recuerdan entre sesiones.'],
     ])
   );
 

@@ -16,9 +16,13 @@
         <span>Rabbit Tool</span>
       </div>
       <div class="toolbar__group">
+        <span class="env-tag" id="envTag" hidden></span>
         <select id="profile" title="Perfil de conexión"></select>
         <button class="icon-btn" id="editConn" title="Editar conexión">
           <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M4 13.5V16h2.5l7.4-7.4-2.5-2.5L4 13.5Zm11.7-6.8a.7.7 0 0 0 0-1L14.3 4.3a.7.7 0 0 0-1 0l-1.2 1.2 2.5 2.5 1.1-1.3Z" fill="currentColor"/></svg>
+        </button>
+        <button class="icon-btn" id="newConn" title="Nuevo perfil de conexión">
+          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
         </button>
         <button class="btn btn--primary" id="connect">Conectar</button>
       </div>
@@ -77,6 +81,7 @@
           <button class="icon-btn" id="nextPage" title="Página siguiente">›</button>
         </div>
         <section class="activity" id="activity">
+          <div class="splitter splitter--h splitter--bare" id="activitySplitter" role="separator" aria-orientation="horizontal" tabindex="0" title="Arrastrá para ajustar el alto · doble clic: restablecer"></div>
           <header class="activity__head">
             <button class="activity__toggle" id="activityToggle" title="Mostrar / ocultar la actividad">
               <span class="activity__caret" aria-hidden="true">▾</span> Actividad <span class="activity__count" id="activityCount"></span>
@@ -86,6 +91,7 @@
           <ol class="activity__list" id="activityList"></ol>
         </section>
       </aside>
+      <div class="splitter splitter--bare" id="sideSplitter" role="separator" aria-orientation="vertical" tabindex="0" title="Arrastrá para ajustar el ancho · doble clic: restablecer"></div>
 
       <main class="main">
         <nav class="tabs" role="tablist">
@@ -198,7 +204,7 @@
               <span class="dim mono" id="loadingCount"></span>
             </div>
           </div>
-          <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0" title="Arrastrá para redimensionar"></div>
+          <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0" title="Arrastrá para ajustar el ancho · doble clic: restablecer"></div>
           <section class="detail" id="detail">
             <div class="detail__head">
               <div class="seg" id="detailTabs">
@@ -234,10 +240,19 @@
 
   <dialog class="modal" id="connDialog">
     <form method="dialog" class="modal__card">
-      <h2>Conexión</h2>
+      <h2 id="connTitle">Conexión</h2>
       <div class="grid">
         <label>Nombre<input name="name" required placeholder="local, qa, prod…" /></label>
         <label>VHost<input name="vhost" placeholder="/" /></label>
+        <label class="span2">Ambiente
+          <select name="env">
+            <option value="">Auto (por nombre, vhost o host)</option>
+            <option value="dev">Desarrollo</option>
+            <option value="qa">QA</option>
+            <option value="prod">Producción</option>
+          </select>
+          <span class="hint env-hint" id="connEnvHint"></span>
+        </label>
         <label class="span2">Management API<input name="api" placeholder="http://localhost:15672" /></label>
         <label class="span2">AMQP<input name="amqp" placeholder="amqp://host:5672 (no el 15672; amqps:// para TLS)" /></label>
         <label>Usuario<input name="user" autocomplete="off" /></label>
@@ -247,6 +262,7 @@
       <div class="conn-test" id="connTest" hidden></div>
       <div class="modal__actions">
         <button type="button" class="btn btn--danger btn--ghost" id="connDelete">Borrar perfil</button>
+        <button type="button" class="btn btn--ghost" id="connCopy" title="Crear un perfil nuevo a partir de estos datos">Duplicar</button>
         <div class="toolbar__spacer"></div>
         <button value="cancel" class="btn" formnovalidate>Cancelar</button>
         <button type="button" class="btn" id="connTestBtn" title="Prueba management y AMQP con estos datos, sin guardar">Probar conexión</button>

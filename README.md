@@ -13,7 +13,9 @@ Herramienta de escritorio liviana (Tauri + Rust) para administrar mensajes de Ra
 - **Archivo JSON**: carga un array de mensajes desde un `.json` (por ejemplo uno descargado y editado), se filtra y se publica en una cola.
 - **Respaldos versionados**: cada envío (mover, ack, publicar desde archivo, re-publicar) guarda su propio respaldo (`.bkp.jsonl`) con metadata (perfil, host, vhost, usuario, origen, filtro, duración, resultado). Re-publicar desde un respaldo crea una versión nueva que apunta a la original. Por defecto se guardan siempre; la retención (7/30/90 días) es opcional.
 - **Confirmación por ambiente**: PROD (rojo, hay que escribir el nombre de la cola), QA (naranja) y DEV (celeste), detectados por el nombre de la cola.
-- **Actividad**: abajo a la izquierda, las últimas 25 operaciones (nack, ack, traslado, carga, re-publicar, descarga, exportar, borrado) con hora, cantidad, colas, perfil y resultado; el borde marca el ambiente y tocarla abre su respaldo. Las más viejas se descartan; el historial completo queda en el log rotativo.
+- **Actividad**: abajo a la izquierda, las últimas 200 operaciones (nack, ack, traslado, carga, re-publicar, descarga, exportar, borrado) con hora, cantidad, colas, perfil y resultado; el borde marca el ambiente y tocarla abre su respaldo. Se guarda en disco (`activity.json`) y persiste entre sesiones, separando las de sesiones anteriores. Las más viejas se descartan; el historial completo queda en el log rotativo.
+- **Ambiente siempre a la vista**: el conejo se viste según el ambiente del perfil (DEV gorra con hélice, QA lentes y lupa, PROD sirena de policía, ojos grandes y sudor; en PROD se tapa los ojos al pasar por acciones que sacan, publican o borran). Además: aura en el logo, etiqueta junto al perfil, franja con huellitas (cinta de precaución en PROD), barras de scroll del color del ambiente, y título de ventana y punto de color en el icono de la barra de tareas. El ambiente se elige en el perfil o, en Auto, se deduce del nombre, vhost o host.
+- **Paneles ajustables**: ancho de la barra izquierda, alto de la actividad y ancho del detalle se arrastran (o se mueven con las flechas); doble clic restablece. Se recuerdan entre sesiones.
 - **Ayuda** (F1) con cómo funciona, estados del respaldo, atajos y archivos locales.
 - **Log** rotativo con el detalle de cada operación y error (botón "Ver log").
 - **Contraseñas** en el Administrador de credenciales del sistema, no en texto plano.
@@ -33,11 +35,12 @@ Bajá el instalador de la [última release](../../releases/latest):
 | AMQP | `amqp://host:5672` | Para leer, mover y publicar. **No** es el 15672. `amqps://` para TLS. |
 | VHost | `/` | |
 
-Los perfiles se guardan en el equipo; la contraseña va al Administrador de credenciales del sistema.
+Los perfiles se crean con **+** junto al selector; el lápiz edita el elegido (renombrar, **Duplicar** como base de uno nuevo, o borrar). Se guardan en el equipo; la contraseña va al Administrador de credenciales del sistema.
 
 ## Archivos locales
 
 - Respaldos: `%APPDATA%\com.dyool.rabbit-tool\backup\` (un `.bkp.jsonl` por envío).
+- Actividad: `%APPDATA%\com.dyool.rabbit-tool\activity.json`.
 - Log: `%LOCALAPPDATA%\com.dyool.rabbit-tool\logs\rabbit-tool.log`.
 
 ## Desarrollo

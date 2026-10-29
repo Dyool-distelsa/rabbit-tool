@@ -1831,6 +1831,100 @@ async fn secret_delete(profile: String) -> R<()> {
     .await
 }
 
+// --- actividad en disco -------------------------------------------------------------
+// Junto a los respaldos y no en el localStorage del WebView: sobrevive a reinicios,
+// a actualizar la app y a que se limpie el caché del WebView.
+
+static ACTIVITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn activity_file(app: &AppHandle) -> R<PathBuf> {
+    let dir = app.path().app_data_dir().map_err(e)?;
+    std::fs::create_dir_all(&dir).map_err(e)?;
+    Ok(dir.join("activity.json"))
+}
+
+/// La actividad guardada; `null` si todavía no hay archivo (la UI migra la del
+/// localStorage). Un archivo ilegible se aparta como `.bad` y se empieza de cero.
+#[tauri::command]
+async fn activity_load(app: AppHandle) -> R<Value> {
+    let path = activity_file(&app)?;
+    blocking(move || {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+            Err(err) => return Err(e(err)),
+        };
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v @ Value::Array(_)) => Ok(v),
+            other => {
+                log::warn!("actividad ilegible ({:?}); se aparta y se empieza de cero", other.err());
+                let _ = std::fs::rename(&path, path.with_extension("json.bad"));
+                Ok(json!([]))
+            }
+        }
+    })
+    .await
+}
+
+/// Reemplaza la actividad guardada (tmp + rename: un corte no deja el archivo a medias).
+#[tauri::command]
+async fn activity_save(app: AppHandle, items: Vec<Value>) -> R<()> {
+    let path = activity_file(&app)?;
+    blocking(move || {
+        let _guard = ACTIVITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&items).map_err(e)?).map_err(e)?;
+        std::fs::rename(&tmp, &path).map_err(e)
+    })
+    .await
+}
+
+// --- ambiente en la ventana ----------------------------------------------------------
+
+/// Ambiente del perfil elegido fuera de la app: en el título y, en Windows, un punto
+/// del color del ambiente sobre el icono de la barra de tareas (se ve en Alt+Tab).
+#[tauri::command]
+fn set_env_indicator(window: tauri::WebviewWindow, env: Option<String>, profile: String) -> R<()> {
+    let badge = match env.as_deref() {
+        Some("prod") => Some(("PROD", [0xeb, 0x57, 0x57])),
+        Some("qa") => Some(("QA", [0xf0, 0x8a, 0x24])),
+        Some("dev") => Some(("DEV", [0x3f, 0xa2, 0xf0])),
+        _ => None,
+    };
+    let title = match badge {
+        Some((tag, _)) => format!("🐇 {tag} · {profile} — Rabbit Tool"),
+        None => format!("Rabbit Tool — {profile}"),
+    };
+    window.set_title(&title).map_err(e)?;
+    #[cfg(target_os = "windows")]
+    {
+        let rgba = badge.map(|(_, rgb)| env_dot(rgb));
+        let icon = rgba.as_deref().map(|px| tauri::image::Image::new(px, ENV_DOT, ENV_DOT));
+        window.set_overlay_icon(icon).map_err(e)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+const ENV_DOT: u32 = 32;
+
+/// Círculo del color dado con borde blanco, en RGBA (bordes suavizados).
+#[cfg(target_os = "windows")]
+fn env_dot(rgb: [u8; 3]) -> Vec<u8> {
+    let n = ENV_DOT as f32;
+    let (c, r) = (n / 2.0, n / 2.0 - 1.0);
+    let mut px = Vec::with_capacity((ENV_DOT * ENV_DOT * 4) as usize);
+    for y in 0..ENV_DOT {
+        for x in 0..ENV_DOT {
+            let d = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt();
+            let alpha = (r - d + 0.5).clamp(0.0, 1.0);
+            let [cr, cg, cb] = if d > r - 3.0 { [255, 255, 255] } else { rgb };
+            px.extend_from_slice(&[cr, cg, cb, (alpha * 255.0) as u8]);
+        }
+    }
+    px
+}
+
 /// Cierra la conexión AMQP cacheada (al editar o cambiar de perfil).
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> R<()> {
@@ -1967,6 +2061,9 @@ fn main() {
             secret_set,
             secret_get_all,
             secret_delete,
+            activity_load,
+            activity_save,
+            set_env_indicator,
             queues_ready,
             disconnect,
             log_ui,
