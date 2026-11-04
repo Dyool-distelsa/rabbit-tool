@@ -140,6 +140,9 @@
         <div class="actionbar" id="localActions" hidden>
           <button class="btn" id="bkpBrowse" title="Elegir otro respaldo guardado">Respaldos guardados…</button>
           <button class="btn btn--sm btn--danger btn--ghost" id="deleteRun" title="Borrar este respaldo completo">Borrar envío</button>
+          <label class="field" title="Cantidad a exportar a JSON (los primeros N que se ven). Vacío o 0 = todos.">
+            N <input id="localExportCount" type="number" min="1" placeholder="Todos" />
+          </label>
           <select id="retention" title="Retención: borra respaldos más viejos (nunca el último ni los que tienen pending/published)">
             <option value="7">Guardar 7 días</option>
             <option value="30">Guardar 30 días</option>
