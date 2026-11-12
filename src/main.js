@@ -2013,9 +2013,11 @@ function stamp() {
 
 $('exportJson').onclick = async () => {
   if (S.op) return;
-  // Seleccionados, o todos los que deja ver el filtro.
+  // Seleccionados, o todos los que deja ver el filtro (en Respaldos, acotado por N si se cargó).
   const picked = picks().size > 0;
-  const chosen = picked ? pickedItems() : S.view;
+  let chosen = picked ? pickedItems() : S.view;
+  const localLimit = S.tab === 'local' && !picked ? parseInt($('localExportCount').value, 10) || 0 : 0;
+  if (localLimit > 0) chosen = chosen.slice(0, localLimit);
   const items = chosen.filter((it) => !it.binary);
   const binary = chosen.length - items.length;
   if (!items.length) return toast.info(chosen.length ? 'Los mensajes elegidos son binarios: no se pueden exportar a JSON' : 'No hay mensajes para exportar');
@@ -2023,7 +2025,13 @@ $('exportJson').onclick = async () => {
   const from =
     S.tab === 'queue' ? S.current : S.tab === 'file' ? S.fileName?.replace(/\.json$/i, '') : `${S.backupMeta?.source ?? 'respaldo'}-respaldo`;
   const notes = [
-    picked ? 'Los seleccionados.' : filter ? `Los que pasan el filtro: ${filter}.` : 'Todos los que se ven.',
+    picked
+      ? 'Los seleccionados.'
+      : localLimit
+        ? `Los primeros ${fmt(localLimit)} que se ven.`
+        : filter
+          ? `Los que pasan el filtro: ${filter}.`
+          : 'Todos los que se ven.',
     S.tab === 'queue' ? 'Solo los mensajes leídos (la página cargada), no toda la cola.' : '',
     binary ? `${fmt(binary)} binarios quedan afuera.` : '',
   ].filter(Boolean);
