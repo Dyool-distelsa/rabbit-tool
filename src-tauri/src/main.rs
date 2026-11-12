@@ -95,8 +95,8 @@ const CHUNK: usize = 250;
 /// consumidor se llevó el resto). Holgado para brokers lentos o mensajes grandes;
 /// cuando corta antes de lo esperado se informa como "detenido".
 const IDLE: Duration = Duration::from_secs(5);
-/// Tope de lectura por operación (prefetch es u16 y la UI tiene que poder con ello).
-const MAX_PEEK: u32 = 20_000;
+/// Tope de lectura por operación (Reader encadena consumers para superar el u16 del prefetch).
+const MAX_PEEK: u32 = 100_000;
 
 #[derive(Default)]
 struct AppState {
